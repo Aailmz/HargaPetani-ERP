@@ -97,10 +97,14 @@ function tunggu(ms) {
 }
 
 function formatWaktu(date = new Date()) {
-  return date.toLocaleString('id-ID', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  }).replace('.', ':');
+  const pad = (n) => String(n).padStart(2, '0');
+  const hh = pad(date.getHours());
+  const mm = pad(date.getMinutes());
+  const ss = pad(date.getSeconds());
+  const dd = pad(date.getDate());
+  const bulan = pad(date.getMonth() + 1);
+  const yy = String(date.getFullYear()).slice(-2);
+  return `${hh}:${mm}:${ss} ${dd}/${bulan}/${yy}`;
 }
 
 async function kirimPesan(jid, text, jedaMsSebelum = 0) {
@@ -162,7 +166,7 @@ async function prosesOnboarding(jid, text) {
     );
 
     try {
-      await appendRow('Employees', [emp.nama, jid.split('@')[0], emp.posisi, new Date().toISOString()]);
+      await appendRow('Employees', [emp.nama, jid.split('@')[0], emp.posisi, formatWaktu()]);
     } catch (err) {
       console.error('⚠️  Gagal catat Employees ke Sheets:', err.message);
     }

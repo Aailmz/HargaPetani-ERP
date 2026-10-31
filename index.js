@@ -12,8 +12,8 @@ const path = require('path');
 
 const db = require('./db');
 const { appendRow, updateCell } = require('./sheets');
-const ai = require('./ai');
 const agent = require('./agent');
+const { formatWaktu } = require('./utils');
 
 let sock;
 
@@ -94,17 +94,6 @@ function normalizeJid(message) {
 
 function tunggu(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function formatWaktu(date = new Date()) {
-  const pad = (n) => String(n).padStart(2, '0');
-  const hh = pad(date.getHours());
-  const mm = pad(date.getMinutes());
-  const ss = pad(date.getSeconds());
-  const dd = pad(date.getDate());
-  const bulan = pad(date.getMonth() + 1);
-  const yy = String(date.getFullYear()).slice(-2);
-  return `${hh}:${mm}:${ss} ${dd}/${bulan}/${yy}`;
 }
 
 async function kirimPesan(jid, text, jedaMsSebelum = 0) {
@@ -231,15 +220,23 @@ async function handleCheckIn(jid, rawMessage) {
   const lat = loc.degreesLatitude;
   const long = loc.degreesLongitude;
   const linkMaps = `https://maps.google.com/?q=${lat},${long}`;
-  const waktu = new Date().toISOString();
-
+  const waktu = formatWaktu();
   const employee = db.getEmployee(jid);
-  await kirimPesan(jid, `Check-in tercatat jam ${new Date().toLocaleTimeString('id-ID')} 👍`);
+
+  const sudahCheckinSebelumnya = db.sudahCheckinHariIni(jid);
+
+  db.catatAbsensiLog(jid, lat, long, waktu);
 
   try {
     await appendRow('Absensi', [employee.nama, jid.split('@')[0], waktu, linkMaps]);
   } catch (err) {
     console.error('⚠️  Gagal catat Absensi ke Sheets:', err.message);
+  }
+
+  if (sudahCheckinSebelumnya) {
+    await kirimPesan(jid, `Lokasi tercatat lagi jam ${waktu.split(', ')[1]} (bukan check-in pertama hari ini, tapi tetap kecatat sebagai histori lokasi 👍)`);
+  } else {
+    await kirimPesan(jid, `Check-in tercatat jam ${waktu.split(', ')[1]} 👍`);
   }
 }
 
@@ -248,7 +245,7 @@ async function handleLiveLocationUpdate(jid, rawMessage) {
   const lat = liveLoc.degreesLatitude;
   const long = liveLoc.degreesLongitude;
   const linkMaps = `https://maps.google.com/?q=${lat},${long}`;
-  const waktu = new Date().toISOString();
+  const waktu = formatWaktu();
 
   const employee = db.getEmployee(jid);
 
@@ -263,7 +260,7 @@ async function handleLiveLocationUpdate(jid, rawMessage) {
 
 async function handleFotoMasuk(jid, caption, rawMessage) {
   const employee = db.getEmployee(jid);
-  const waktu = new Date().toISOString();
+  const waktu = formatWaktu();
 
   const captionLower = (caption || '').toLowerCase();
   const isKwitansi = captionLower.includes('kwitansi') || captionLower.includes('trx') || captionLower.includes('order');
@@ -277,35 +274,16 @@ async function handleFotoMasuk(jid, caption, rawMessage) {
     const buffer = await downloadMediaMessage(rawMessage, 'buffer', {});
     fs.writeFileSync(savePath, buffer);
 
-    await appendRow(tabTujuan, [employee.nama, jid.split('@')[0], waktu, caption || '(tanpa keterangan)', namaFile]);
-    await kirimPesan(jid, 'Foto sudah tercatat, makasih 🙏');
+    const keteranganFinal = caption && caption.trim() ? caption.trim() : '⚠️ Tidak ada keterangan';
+    await appendRow(tabTujuan, [employee.nama, jid.split('@')[0], waktu, keteranganFinal, namaFile]);
+
+    const balasan = caption && caption.trim()
+      ? 'Oke, foto sudah tercatat 👍'
+      : 'Foto sudah tercatat, tapi ini buat apa ya? Next time kasih keterangan di caption biar jelas 🙏';
+    await kirimPesan(jid, balasan);
   } catch (err) {
     console.error('❌ Gagal proses foto:', err.message);
     await kirimPesan(jid, 'Maaf, ada kendala pas proses foto. Boleh dikirim ulang?');
-  }
-}
-
-async function handleReimburseBaru(jid, text) {
-  if (!text) return; // skip pesan kosong (misal cuma emoji/sticker ke-filter duluan)
-
-  const employee = db.getEmployee(jid);
-  const waktu = new Date().toISOString();
-
-  const reimburseId = db.buatReimburseBaru(jid, text);
-
-  await kirimPesan(jid, 'Oke, pengajuan reimburse sudah diteruskan ke tim. Ditunggu ya 🙏');
-
-  const operatorJid = process.env.OPERATOR_JID;
-  await kirimPesan(
-    operatorJid,
-    `💰 Reimburse baru dari ${employee.nama} (${jid.split('@')[0]}):\n\n"${text}"\n\n[reimburse #${reimburseId}]`
-  );
-
-  try {
-    const row = await appendRow('Reimburse', [employee.nama, jid.split('@')[0], waktu, text, 'PENDING', '']);
-    db.setSheetsRowReimburse(reimburseId, row);
-  } catch (err) {
-    console.error('⚠️  Gagal catat Reimburse ke Sheets:', err.message);
   }
 }
 

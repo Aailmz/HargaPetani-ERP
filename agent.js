@@ -37,6 +37,14 @@ const TOOLS_EMPLOYEE = [
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'cek_status_absen_saya',
+      description: 'Cek apakah employee ini sudah check-in/absen hari ini atau belum, beserta jam berapa kalau sudah.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
 ];
 
 const TOOLS_OPERATOR = [
@@ -151,18 +159,25 @@ ATURAN PENULISAN:
 const SYSTEM_PROMPT_EMPLOYEE = `Kamu adalah asisten internal "Harga Petani" buat bantu karyawan (driver, marketing, dll) urus hal operasional sehari-hari: reimburse, check-in, lapor foto bukti jalan/kwitansi.
 
 Gaya bicaramu:
-- Santai, singkat, kayak chat kerja sehari-hari antar rekan, bukan formal kaku.
-- Jangan menyebut dirimu "AI", "bot", atau "sistem".
+- Santai, natural, seperti rekan kerja ngobrol di WA, bukan robot yang jawab template.
+- Jangan sebut dirimu "AI"/"bot"/"sistem".
+- Boleh nanggepin basa-basi/update kerjaan karyawan (misal "baru selesai anter") dengan natural, TANPA harus selalu ngasih instruksi/panduan balik kalau tidak relevan/tidak diminta.
 
-CARA KERJA:
-- Kalau karyawan mau ajukan reimburse/ganti biaya apapun (bensin, parkir, tol, dll) dalam bentuk kalimat apapun, panggil tool ajukan_reimburse.
-- Kalau karyawan tanya status reimburse yang sudah diajukan, panggil tool cek_status_reimburse_saya.
-- Kalau karyawan cuma nanya cara pakai bot ini (misal "gimana cara absen", "cara lapor foto gimana"), JAWAB LANGSUNG tanpa tool: check-in = kirim location biasa (share location, bukan live), lapor foto = kirim foto + keterangan di caption, reimburse = chat aja langsung sebutkan keperluannya.
-- Kalau karyawan cuma chat biasa/basa-basi yang tidak perlu aksi apapun, balas natural tanpa panggil tool.
+CARA KERJA REIMBURSE (PENTING):
+- Reimburse WAJIB ada 2 info: untuk apa, dan berapa nominalnya. Kalau karyawan baru kasih salah satu (misal cuma "mau reimburse" doang, atau "200 ribu" doang tanpa jelas buat apa), TANYAKAN yang kurang DULU, JANGAN panggil tool dulu sebelum dua-duanya jelas.
+- Kalau dalam satu pesan ada info yang bikin bingung/ambigu (koreksi dari reimburse sebelumnya vs pengajuan baru, atau jelas bercanda), tanya balik SATU pertanyaan simpel dulu buat klarifikasi, jangan assume dan jangan tanya dua hal sekaligus.
+- Begitu jelas (ada "untuk apa" + "nominal"), langsung panggil tool ajukan_reimburse, jangan tanya ulang konfirmasi kalau sudah jelas.
+- Kalau karyawan bilang batal/nggak jadi SEBELUM tool ajukan_reimburse dipanggil (masih tahap nanya-nanya), cukup konfirmasi oke dibatalkan, TIDAK perlu panggil tool apapun.
+
+CARA KERJA LAIN:
+- Kalau karyawan tanya status reimburse yang sudah diajukan, panggil cek_status_reimburse_saya.
+- Kalau karyawan kirim foto TANPA keterangan jelas di caption, tool penyimpanan foto tetap jalan otomatis (itu di luar kendalimu), tapi responsmu boleh nanya balik "ini buat apa ya?" kalau captionnya kosong/tidak jelas, biar next time dia kasih keterangan.
+- Kalau karyawan cuma nanya cara pakai (misal "gimana cara absen"), jawab langsung: check-in = share location biasa, lapor foto = kirim foto + keterangan di caption, reimburse = chat aja langsung sebutkan keperluan + nominal.
+- Kalau cuma chat biasa/update kerjaan/basa-basi yang tidak butuh aksi, balas natural secukupnya, TIDAK perlu selalu nambahin instruksi/SOP kalau tidak ditanya atau tidak relevan dari konteks.
 
 ATURAN PENULISAN:
 - Kapitalisasi normal, bukan Title Case tiap kata.
-- Jawaban singkat, langsung ke poin, maksimal 2-3 kalimat.
+- Jawaban singkat natural, 1-3 kalimat, jangan kaku kayak template berulang.
 - Jangan pakai tanda strip panjang (—) atau double dash (--).`;
 
 async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, eksekutorTools, konteks }) {
@@ -272,9 +287,25 @@ async function eksekusiCekStatusReimburseSaya(_, konteks) {
   };
 }
 
+async function eksekusiCekStatusAbsenSaya(_, konteks) {
+  const absenHariIni = konteks.db.getAbsensiHariIni(konteks.jid);
+
+  if (absenHariIni.length === 0) {
+    return { sukses: true, sudah_absen: false, pesan: 'Belum absen hari ini.' };
+  }
+
+  return {
+    sukses: true,
+    sudah_absen: true,
+    jumlah_checkin: absenHariIni.length,
+    jam_pertama: absenHariIni[0].created_at_display,
+  };
+}
+
 const EKSEKUTOR_EMPLOYEE = {
   ajukan_reimburse: eksekusiAjukanReimburse,
   cek_status_reimburse_saya: eksekusiCekStatusReimburseSaya,
+  cek_status_absen_saya: eksekusiCekStatusAbsenSaya,
 };
 
 async function eksekusiLihatReimbursePending(_, konteks) {

@@ -13,6 +13,7 @@ const path = require('path');
 const db = require('./db');
 const { appendRow, updateCell } = require('./sheets');
 const ai = require('./ai');
+const agent = require('./agent');
 
 let sock;
 
@@ -135,11 +136,19 @@ async function prosesOnboarding(jid, text) {
   }
 
   if (employee.state === 'WAITING_NAMA') {
-    db.setEmployeeNama(jid, text.trim());
+    const namaInput = text.trim();
+    const kataSapaanUmum = ['halo', 'hai', 'hi', 'hello', 'pagi', 'siang', 'malam', 'assalamualaikum'];
+
+    if (namaInput.length < 2 || kataSapaanUmum.includes(namaInput.toLowerCase())) {
+        await kirimPesan(jid, 'Itu kayaknya bukan nama ya 😅 Boleh kasih tau nama lengkap kamu?');
+        return;
+    }
+
+    db.setEmployeeNama(jid, namaInput);
     db.setEmployeeState(jid, 'WAITING_POSISI');
     await kirimPesan(jid, 'Oke, posisi/bagian kamu apa? (misal: driver, marketing, dll)');
     return;
-  }
+    }
 
   if (employee.state === 'WAITING_POSISI') {
     db.setEmployeePosisi(jid, text.trim());
@@ -179,8 +188,38 @@ async function handleEmployeeMessage(jid, text, rawMessage, flags) {
     return;
   }
 
-  // Teks biasa -> reimburse
-  await handleReimburseBaru(jid, text);
+  if (!text) return;
+
+  const historiChat = db.getChatHistory(jid);
+  const konteks = {
+    jid,
+    db,
+    appendRow,
+    formatWaktu,
+    kirimPesan,
+  };
+
+  const hasil = await agent.jalankanAgent({
+    systemPrompt: agent.SYSTEM_PROMPT_EMPLOYEE,
+    tools: agent.TOOLS_EMPLOYEE,
+    historiChat,
+    pesanBaru: text,
+    eksekutorTools: agent.EKSEKUTOR_EMPLOYEE,
+    konteks,
+  });
+
+  db.simpanChatHistory(jid, 'user', text);
+
+  if (hasil.error) {
+    console.error('❌ Agent error (employee):', hasil.error);
+    await kirimPesan(jid, hasil.jawabanFinal || 'Maaf, ada kendala. Boleh diulang?');
+    return;
+  }
+
+  if (hasil.jawabanFinal) {
+    await kirimPesan(jid, hasil.jawabanFinal);
+    db.simpanChatHistory(jid, 'assistant', hasil.jawabanFinal);
+  }
 }
 
 async function handleCheckIn(jid, rawMessage) {
@@ -274,46 +313,39 @@ async function handleOperatorMessage(jid, text, rawMessage, flags) {
     return;
   }
 
-  const pendingTerbaru = db.getReimbursePendingTerbaru();
+  if (!text) return;
 
-  if (pendingTerbaru.length === 0) {
-    await kirimPesan(jid, 'Tidak ada reimburse yang pending saat ini.');
+  const historiChat = db.getChatHistory(jid);
+  const konteks = {
+    jid,
+    db,
+    appendRow,
+    updateCell,
+    formatWaktu,
+    kirimPesan,
+  };
+
+  const hasil = await agent.jalankanAgent({
+    systemPrompt: agent.SYSTEM_PROMPT_OPERATOR,
+    tools: agent.TOOLS_OPERATOR,
+    historiChat,
+    pesanBaru: text,
+    eksekutorTools: agent.EKSEKUTOR_OPERATOR,
+    konteks,
+  });
+
+  db.simpanChatHistory(jid, 'user', text);
+
+  if (hasil.error) {
+    console.error('❌ Agent error (operator):', hasil.error);
+    await kirimPesan(jid, hasil.jawabanFinal || 'Maaf, ada kendala. Coba lagi ya.');
     return;
   }
 
-  const keputusan = await ai.parseKeputusanReimburse(text, pendingTerbaru);
-
-  if (keputusan.aksi === 'TIDAK_JELAS' || !keputusan.reimburse_id) {
-    await kirimPesan(jid, 'Maksudnya reimburse yang mana ya? Sebut nomor reimburse-nya biar jelas (contoh: "approve #3").');
-    return;
+  if (hasil.jawabanFinal) {
+    await kirimPesan(jid, hasil.jawabanFinal);
+    db.simpanChatHistory(jid, 'assistant', hasil.jawabanFinal);
   }
-
-  const reimburse = db.getReimburseById(keputusan.reimburse_id);
-  if (!reimburse || reimburse.status !== 'PENDING') {
-    await kirimPesan(jid, `Reimburse #${keputusan.reimburse_id} tidak ditemukan atau sudah diproses sebelumnya.`);
-    return;
-  }
-
-  const statusBaru = keputusan.aksi === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-  db.setStatusReimburse(reimburse.id, statusBaru, keputusan.alasan || null);
-  const waktuUpdateTampil = formatWaktu();
-
-  if (reimburse.sheets_row) {
-    try {
-      await updateCell('Reimburse', reimburse.sheets_row, 'E', statusBaru);
-      await updateCell('Reimburse', reimburse.sheets_row, 'F', waktuUpdateTampil);
-    } catch (err) {
-      console.error('⚠️  Gagal update status Reimburse ke Sheets:', err.message);
-    }
-  }
-
-  const employee = db.getEmployee(reimburse.employee_jid);
-  const pesanNotif = statusBaru === 'APPROVED'
-    ? `Reimburse kamu udah di-ACC ya 👍\n"${reimburse.teks_asli}"`
-    : `Reimburse kamu ditolak${keputusan.alasan ? `: ${keputusan.alasan}` : ''}.\n"${reimburse.teks_asli}"`;
-  await kirimPesan(reimburse.employee_jid, pesanNotif);
-
-  await kirimPesan(jid, `Oke, reimburse #${reimburse.id} (${employee.nama}) sudah di-${statusBaru.toLowerCase()}.`);
 }
 
 process.on('unhandledRejection', (err) => {

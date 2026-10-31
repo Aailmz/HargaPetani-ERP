@@ -46,6 +46,17 @@ db.exec(`
   )
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS absensi_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_jid TEXT NOT NULL,
+    lat REAL,
+    long REAL,
+    created_at_display TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 require('dotenv').config();
 
 // ========== SETUP OPERATOR ==========
@@ -110,6 +121,41 @@ function setEmployeePosisi(jid, posisi) {
 
 function getAllEmployees() {
   return db.prepare('SELECT * FROM employees WHERE is_registered = 1 ORDER BY created_at ASC').all();
+}
+
+// ========== ABSENSI ==========
+
+function catatAbsensiLog(employeeJid, lat, long, waktuDisplay) {
+  db.prepare(`
+    INSERT INTO absensi_log (employee_jid, lat, long, created_at_display) VALUES (?, ?, ?, ?)
+  `).run(employeeJid, lat, long, waktuDisplay);
+}
+
+function sudahCheckinHariIni(employeeJid) {
+  const row = db.prepare(`
+    SELECT COUNT(*) as c FROM absensi_log
+    WHERE employee_jid = ? AND date(created_at) = date('now', 'localtime')
+  `).get(employeeJid);
+  return row.c > 0;
+}
+
+function getAbsensiHariIni(employeeJid) {
+  return db.prepare(`
+    SELECT * FROM absensi_log
+    WHERE employee_jid = ? AND date(created_at) = date('now', 'localtime')
+    ORDER BY created_at ASC
+  `).all(employeeJid);
+}
+
+function getEmployeeBelumAbsenHariIni() {
+  return db.prepare(`
+    SELECT * FROM employees
+    WHERE is_registered = 1
+    AND jid NOT IN (
+      SELECT DISTINCT employee_jid FROM absensi_log
+      WHERE date(created_at) = date('now', 'localtime')
+    )
+  `).all();
 }
 
 // ========== REIMBURSE ==========
@@ -195,4 +241,10 @@ module.exports = {
   // chat history
   simpanChatHistory,
   getChatHistory,
+
+    // absensi
+  catatAbsensiLog,
+  sudahCheckinHariIni,
+  getAbsensiHariIni,
+  getEmployeeBelumAbsenHariIni,
 };

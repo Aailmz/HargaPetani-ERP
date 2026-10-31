@@ -12,20 +12,24 @@ const MAX_TOOL_ITERATIONS = 5;
 // ========== TOOLS — EMPLOYEE ==========
 
 const TOOLS_EMPLOYEE = [
-  {
+    {
     type: 'function',
     function: {
       name: 'ajukan_reimburse',
-      description: 'Catat pengajuan reimburse dan teruskan ke operator untuk di-approve/reject. Dipakai kalau employee minta reimburse/ganti biaya apapun (bensin, parkir, tol, dll), dalam bentuk apapun kalimatnya.',
+      description: 'Catat pengajuan reimburse dan teruskan ke operator untuk di-approve/reject. HANYA panggil ini kalau nominal (angka pasti) dan peruntukan (jelas buat apa) SUDAH LENGKAP dari percakapan. Kalau salah satu belum jelas, tanya dulu, jangan panggil tool ini.',
       parameters: {
         type: 'object',
         properties: {
-          keterangan: {
+          nominal: {
+            type: 'integer',
+            description: 'Nominal reimburse dalam Rupiah, angka murni (contoh: 50000, bukan "50rb" atau string).',
+          },
+          peruntukan: {
             type: 'string',
-            description: 'Ringkasan jelas soal apa yang direimburse dan nominalnya (kalau disebutkan), berdasarkan teks asli dari employee.',
+            description: 'Keterangan singkat buat apa reimburse ini, dirapikan (contoh: "Bensin antar pesanan", bukan kalimat mentah apa adanya).',
           },
         },
-        required: ['keterangan'],
+        required: ['nominal', 'peruntukan'],
       },
     },
   },
@@ -136,6 +140,27 @@ const TOOLS_OPERATOR = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'lengkapi_kwitansi',
+      description: 'Lengkapi data kwitansi yang baru diupload (foto sudah masuk, tapi nominal/peruntukan belum jelas). HANYA panggil ini kalau ada kwitansi yang sedang menunggu kelengkapan data DAN kedua info (nominal + peruntukan) sudah bisa dipastikan dari pesan employee sekarang.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nominal: {
+            type: 'integer',
+            description: 'Nominal di kwitansi, angka murni.',
+          },
+          peruntukan: {
+            type: 'string',
+            description: 'Keterangan singkat kwitansi ini buat apa, dirapikan.',
+          },
+        },
+        required: ['nominal', 'peruntukan'],
+      },
+    },
+  },
 ];
 
 const SYSTEM_PROMPT_OPERATOR = `Kamu adalah asisten kerja buat operator ERP internal "Harga Petani". Operator ini rekan kerja yang kamu bantu urus approval reimburse & data karyawan.
@@ -161,23 +186,30 @@ const SYSTEM_PROMPT_EMPLOYEE = `Kamu adalah asisten internal "Harga Petani" buat
 Gaya bicaramu:
 - Santai, natural, seperti rekan kerja ngobrol di WA, bukan robot yang jawab template.
 - Jangan sebut dirimu "AI"/"bot"/"sistem".
-- Boleh nanggepin basa-basi/update kerjaan karyawan (misal "baru selesai anter") dengan natural, TANPA harus selalu ngasih instruksi/panduan balik kalau tidak relevan/tidak diminta.
+- Boleh nanggepin basa-basi/update kerjaan karyawan dengan natural, TANPA harus selalu ngasih instruksi/panduan balik kalau tidak relevan/tidak diminta.
 
-CARA KERJA REIMBURSE (PENTING):
-- Reimburse WAJIB ada 2 info: untuk apa, dan berapa nominalnya. Kalau karyawan baru kasih salah satu (misal cuma "mau reimburse" doang, atau "200 ribu" doang tanpa jelas buat apa), TANYAKAN yang kurang DULU, JANGAN panggil tool dulu sebelum dua-duanya jelas.
-- Kalau dalam satu pesan ada info yang bikin bingung/ambigu (koreksi dari reimburse sebelumnya vs pengajuan baru, atau jelas bercanda), tanya balik SATU pertanyaan simpel dulu buat klarifikasi, jangan assume dan jangan tanya dua hal sekaligus.
-- Begitu jelas (ada "untuk apa" + "nominal"), langsung panggil tool ajukan_reimburse, jangan tanya ulang konfirmasi kalau sudah jelas.
-- Kalau karyawan bilang batal/nggak jadi SEBELUM tool ajukan_reimburse dipanggil (masih tahap nanya-nanya), cukup konfirmasi oke dibatalkan, TIDAK perlu panggil tool apapun.
+CARA KERJA REIMBURSE (PENTING, DATA HARUS LENGKAP):
+- Reimburse WAJIB ada 2 data pasti: nominal (angka jelas dalam Rupiah) dan peruntukan (jelas buat apa).
+- Kalau karyawan baru kasih salah satu, atau nominalnya nggak jelas (misal "sekitar 50rb-an"), TANYAKAN yang kurang/minta kepastian angka dulu. JANGAN panggil tool ajukan_reimburse sebelum dua-duanya pasti.
+- Convert semua bentuk nominal ("goceng", "50rb", "lima puluh ribu") ke angka murni Rupiah.
+- Kalau ambigu (koreksi vs pengajuan baru, atau jelas bercanda), tanya SATU pertanyaan simpel buat klarifikasi.
+- Begitu dua data lengkap dan pasti, langsung panggil tool ajukan_reimburse, jangan tanya ulang konfirmasi.
+- Kalau karyawan batal SEBELUM tool dipanggil, konfirmasi oke dibatalkan, tidak perlu panggil tool.
+
+CARA KERJA KWITANSI YANG BELUM LENGKAP:
+- Kalau ada notice "KWITANSI MENUNGGU KELENGKAPAN" di konteks, itu artinya karyawan baru upload foto kwitansi tapi nominal/peruntukannya belum jelas dari caption. Pesan karyawan SEKARANG kemungkinan adalah jawaban susulan buat melengkapi itu.
+- Begitu nominal dan peruntukan kwitansi itu jelas dari pesan karyawan, panggil tool lengkapi_kwitansi.
+- Kalau masih belum jelas, tanya lagi sampai pasti.
 
 CARA KERJA LAIN:
-- Kalau karyawan tanya status reimburse yang sudah diajukan, panggil cek_status_reimburse_saya.
-- Kalau karyawan kirim foto TANPA keterangan jelas di caption, tool penyimpanan foto tetap jalan otomatis (itu di luar kendalimu), tapi responsmu boleh nanya balik "ini buat apa ya?" kalau captionnya kosong/tidak jelas, biar next time dia kasih keterangan.
-- Kalau karyawan cuma nanya cara pakai (misal "gimana cara absen"), jawab langsung: check-in = share location biasa, lapor foto = kirim foto + keterangan di caption, reimburse = chat aja langsung sebutkan keperluan + nominal.
-- Kalau cuma chat biasa/update kerjaan/basa-basi yang tidak butuh aksi, balas natural secukupnya, TIDAK perlu selalu nambahin instruksi/SOP kalau tidak ditanya atau tidak relevan dari konteks.
+- Kalau karyawan tanya status reimburse, panggil cek_status_reimburse_saya.
+- Kalau karyawan tanya status absen hari ini, panggil cek_status_absen_saya.
+- Kalau karyawan cuma nanya cara pakai, jawab langsung: check-in = share location, lapor foto = kirim foto + keterangan jelas (nominal+peruntukan) di caption, reimburse = chat aja sebutkan keperluan + nominal.
+- Kalau cuma chat biasa/update kerjaan/basa-basi yang tidak butuh aksi, balas natural secukupnya.
 
 ATURAN PENULISAN:
 - Kapitalisasi normal, bukan Title Case tiap kata.
-- Jawaban singkat natural, 1-3 kalimat, jangan kaku kayak template berulang.
+- Jawaban singkat natural, 1-3 kalimat.
 - Jangan pakai tanda strip panjang (—) atau double dash (--).`;
 
 async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, eksekutorTools, konteks }) {
@@ -249,26 +281,50 @@ async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, ekse
 
 // ========== EKSEKUTOR — EMPLOYEE ==========
 
-async function eksekusiAjukanReimburse({ keterangan }, konteks) {
+async function eksekusiAjukanReimburse({ nominal, peruntukan }, konteks) {
   const { db: dbModule, appendRow, formatWaktu } = konteks;
   const employee = dbModule.getEmployee(konteks.jid);
   const waktu = formatWaktu();
 
-  const reimburseId = dbModule.buatReimburseBaru(konteks.jid, keterangan);
+  const reimburseId = dbModule.buatReimburseBaru(konteks.jid, peruntukan, nominal);
 
   await konteks.kirimPesan(
     process.env.OPERATOR_JID,
-    `💰 Reimburse baru dari ${employee.nama} (${konteks.jid.split('@')[0]}):\n\n"${keterangan}"\n\n[reimburse #${reimburseId}]`
+    `💰 Reimburse baru\nDari: ${employee.nama} (${konteks.jid.split('@')[0]})\nPeruntukan: ${peruntukan}\nNominal: Rp${nominal.toLocaleString('id-ID')}\n\n[reimburse #${reimburseId}]`
   );
 
   try {
-    const row = await appendRow('Reimburse', [employee.nama, konteks.jid.split('@')[0], waktu, keterangan, 'PENDING', '']);
+    const row = await appendRow('Reimburse', [
+      employee.nama, konteks.jid.split('@')[0], waktu, peruntukan, nominal, 'PENDING', ''
+    ]);
     dbModule.setSheetsRowReimburse(reimburseId, row);
   } catch (err) {
     console.error('⚠️  Gagal catat Reimburse ke Sheets:', err.message);
   }
 
   return { sukses: true, reimburse_id: reimburseId, pesan: 'Reimburse berhasil diajukan dan diteruskan ke tim.' };
+}
+
+async function eksekusiLengkapiKwitansi({ nominal, peruntukan }, konteks) {
+  const { db: dbModule, appendRow, formatWaktu } = konteks;
+  const pending = dbModule.getKwitansiPendingAktif(konteks.jid);
+
+  if (!pending) {
+    return { sukses: false, pesan: 'Tidak ada kwitansi yang sedang menunggu kelengkapan data.' };
+  }
+
+  const employee = dbModule.getEmployee(konteks.jid);
+  const waktu = formatWaktu();
+
+  try {
+    await appendRow('Kwitansi', [employee.nama, konteks.jid.split('@')[0], waktu, peruntukan, nominal, pending.nama_file]);
+  } catch (err) {
+    console.error('⚠️  Gagal catat Kwitansi ke Sheets:', err.message);
+  }
+
+  dbModule.hapusKwitansiPending(pending.id);
+
+  return { sukses: true, pesan: 'Kwitansi sudah lengkap dan tercatat.' };
 }
 
 async function eksekusiCekStatusReimburseSaya(_, konteks) {
@@ -283,7 +339,9 @@ async function eksekusiCekStatusReimburseSaya(_, konteks) {
   return {
     sukses: true,
     jumlah: semua.length,
-    daftar: semua.map((r) => ({ id: r.id, keterangan: r.teks_asli, status: r.status, alasan_reject: r.alasan_reject })),
+    daftar: semua.map((r) => ({
+      id: r.id, peruntukan: r.peruntukan, nominal: r.nominal, status: r.status, alasan_reject: r.alasan_reject,
+    })),
   };
 }
 
@@ -306,6 +364,7 @@ const EKSEKUTOR_EMPLOYEE = {
   ajukan_reimburse: eksekusiAjukanReimburse,
   cek_status_reimburse_saya: eksekusiCekStatusReimburseSaya,
   cek_status_absen_saya: eksekusiCekStatusAbsenSaya,
+  lengkapi_kwitansi: eksekusiLengkapiKwitansi,
 };
 
 async function eksekusiLihatReimbursePending(_, konteks) {
@@ -320,7 +379,7 @@ async function eksekusiLihatReimbursePending(_, konteks) {
     jumlah: pending.length,
     daftar: pending.map((r) => {
       const emp = konteks.db.getEmployee(r.employee_jid);
-      return { id: r.id, nama: emp.nama, keterangan: r.teks_asli };
+      return { id: r.id, nama: emp.nama, peruntukan: r.peruntukan, nominal: r.nominal };
     }),
   };
 }
@@ -340,8 +399,8 @@ async function prosesKeputusanReimburse(reimburseId, statusBaru, alasan, konteks
 
   if (reimburse.sheets_row) {
     try {
-      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'E', statusBaru);
-      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'F', waktuUpdate);
+      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'F', statusBaru);
+      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'G', waktuUpdate);
     } catch (err) {
       console.error('⚠️  Gagal update status Reimburse ke Sheets:', err.message);
     }
@@ -349,8 +408,8 @@ async function prosesKeputusanReimburse(reimburseId, statusBaru, alasan, konteks
 
   const employee = konteks.db.getEmployee(reimburse.employee_jid);
   const pesanNotif = statusBaru === 'APPROVED'
-    ? `Reimburse kamu udah di-ACC ya 👍\n"${reimburse.teks_asli}"`
-    : `Reimburse kamu ditolak${alasan ? `: ${alasan}` : ''}.\n"${reimburse.teks_asli}"`;
+    ? `Reimburse kamu udah di-ACC ya 👍\n${reimburse.peruntukan}: Rp${reimburse.nominal.toLocaleString('id-ID')}`
+    : `Reimburse kamu ditolak${alasan ? `: ${alasan}` : ''}.\n${reimburse.peruntukan}: Rp${reimburse.nominal.toLocaleString('id-ID')}`;
 
   await konteks.kirimPesan(reimburse.employee_jid, pesanNotif);
 

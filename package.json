@@ -1,0 +1,21 @@
+{
+  "name": "harga-petani-erp",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.9",
+    "googleapis": "^189.0.0",
+    "node-cron": "^4.6.0",
+    "openai": "^7.47.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

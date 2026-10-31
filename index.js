@@ -14,6 +14,7 @@ const db = require('./db');
 const { appendRow, updateCell } = require('./sheets');
 const agent = require('./agent');
 const { formatWaktu } = require('./utils');
+const ai = require('./ai');
 
 let sock;
 
@@ -184,19 +185,19 @@ async function handleEmployeeMessage(jid, text, rawMessage, flags) {
   if (!text) return;
 
   const historiChat = db.getChatHistory(jid);
-  const konteks = {
-    jid,
-    db,
-    appendRow,
-    formatWaktu,
-    kirimPesan,
-  };
+  const konteks = { jid, db, appendRow, formatWaktu, kirimPesan };
+
+  const kwitansiPending = db.getKwitansiPendingAktif(jid);
+  let pesanBaru = text;
+  if (kwitansiPending) {
+    pesanBaru = `[KWITANSI MENUNGGU KELENGKAPAN, file: ${kwitansiPending.nama_file}]\n${text}`;
+  }
 
   const hasil = await agent.jalankanAgent({
     systemPrompt: agent.SYSTEM_PROMPT_EMPLOYEE,
     tools: agent.TOOLS_EMPLOYEE,
     historiChat,
-    pesanBaru: text,
+    pesanBaru,
     eksekutorTools: agent.EKSEKUTOR_EMPLOYEE,
     konteks,
   });
@@ -225,18 +226,29 @@ async function handleCheckIn(jid, rawMessage) {
 
   const sudahCheckinSebelumnya = db.sudahCheckinHariIni(jid);
 
+  const jamSekarang = new Date().getHours();
+  let statusAbsen;
+  if (jamSekarang >= 7 && jamSekarang < 9) {
+    statusAbsen = 'Tepat Waktu';
+  } else if (jamSekarang >= 9) {
+    statusAbsen = 'Telat';
+  } else {
+    statusAbsen = 'Di Luar Jam Absen';
+  }
+
   db.catatAbsensiLog(jid, lat, long, waktu);
 
   try {
-    await appendRow('Absensi', [employee.nama, jid.split('@')[0], waktu, linkMaps]);
+    await appendRow('Absensi', [employee.nama, jid.split('@')[0], waktu, linkMaps, statusAbsen]);
   } catch (err) {
     console.error('⚠️  Gagal catat Absensi ke Sheets:', err.message);
   }
 
   if (sudahCheckinSebelumnya) {
-    await kirimPesan(jid, `Lokasi tercatat lagi jam ${waktu.split(', ')[1]} (bukan check-in pertama hari ini, tapi tetap kecatat sebagai histori lokasi 👍)`);
+    await kirimPesan(jid, `Lokasi tercatat lagi jam ${waktu.split(', ')[1]} (bukan check-in pertama hari ini) 👍`);
   } else {
-    await kirimPesan(jid, `Check-in tercatat jam ${waktu.split(', ')[1]} 👍`);
+    const infoTelat = statusAbsen === 'Telat' ? ' (telat ya, jam absen 7-9 pagi)' : '';
+    await kirimPesan(jid, `Check-in tercatat jam ${waktu.split(', ')[1]}${infoTelat} 👍`);
   }
 }
 
@@ -264,26 +276,46 @@ async function handleFotoMasuk(jid, caption, rawMessage) {
 
   const captionLower = (caption || '').toLowerCase();
   const isKwitansi = captionLower.includes('kwitansi') || captionLower.includes('trx') || captionLower.includes('order');
-  const folderTujuan = isKwitansi ? 'kwitansi' : 'foto-jalan';
-  const tabTujuan = isKwitansi ? 'Kwitansi' : 'FotoJalan';
 
   const namaFile = `${jid.split('@')[0]}-${Date.now()}.jpg`;
+  const folderTujuan = isKwitansi ? 'kwitansi' : 'foto-jalan';
   const savePath = path.join(__dirname, 'images', folderTujuan, namaFile);
 
   try {
     const buffer = await downloadMediaMessage(rawMessage, 'buffer', {});
     fs.writeFileSync(savePath, buffer);
-
-    const keteranganFinal = caption && caption.trim() ? caption.trim() : '⚠️ Tidak ada keterangan';
-    await appendRow(tabTujuan, [employee.nama, jid.split('@')[0], waktu, keteranganFinal, namaFile]);
-
-    const balasan = caption && caption.trim()
-      ? 'Oke, foto sudah tercatat 👍'
-      : 'Foto sudah tercatat, tapi ini buat apa ya? Next time kasih keterangan di caption biar jelas 🙏';
-    await kirimPesan(jid, balasan);
   } catch (err) {
-    console.error('❌ Gagal proses foto:', err.message);
+    console.error('❌ Gagal download foto:', err.message);
     await kirimPesan(jid, 'Maaf, ada kendala pas proses foto. Boleh dikirim ulang?');
+    return;
+  }
+
+  if (!isKwitansi) {
+    // FotoJalan tetap bebas caption, nggak perlu structured data
+    const keteranganFinal = caption && caption.trim() ? caption.trim() : '(tanpa keterangan)';
+    try {
+      await appendRow('FotoJalan', [employee.nama, jid.split('@')[0], waktu, keteranganFinal, namaFile]);
+    } catch (err) {
+      console.error('⚠️  Gagal catat FotoJalan ke Sheets:', err.message);
+    }
+    await kirimPesan(jid, 'Oke, foto sudah tercatat 👍');
+    return;
+  }
+
+  // Kwitansi -> coba extract nominal+peruntukan dari caption
+  const ekstraksi = await ai.ekstrakNominalPeruntukan(caption || '');
+
+  if (ekstraksi.nominal && ekstraksi.peruntukan) {
+    try {
+      await appendRow('Kwitansi', [employee.nama, jid.split('@')[0], waktu, ekstraksi.peruntukan, ekstraksi.nominal, namaFile]);
+    } catch (err) {
+      console.error('⚠️  Gagal catat Kwitansi ke Sheets:', err.message);
+    }
+    await kirimPesan(jid, 'Oke, kwitansi sudah tercatat 👍');
+  } else {
+    const pendingId = db.buatKwitansiPending(jid, namaFile);
+    await kirimPesan(jid, 'Kwitansinya udah kesimpan, tapi nominal/keperluannya belum jelas nih. Buat apa dan berapa nominalnya?');
+    console.log(`(Kwitansi pending #${pendingId} menunggu kelengkapan dari ${jid})`);
   }
 }
 

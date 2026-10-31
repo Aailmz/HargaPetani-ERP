@@ -27,8 +27,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS reimburse (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     employee_jid TEXT NOT NULL,
-    teks_asli TEXT NOT NULL,
-    status TEXT DEFAULT 'PENDING',      -- PENDING | APPROVED | REJECTED
+    peruntukan TEXT NOT NULL,
+    nominal INTEGER NOT NULL,
+    status TEXT DEFAULT 'PENDING',
     alasan_reject TEXT,
     sheets_row INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -53,6 +54,17 @@ db.exec(`
     lat REAL,
     long REAL,
     created_at_display TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS kwitansi_pending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_jid TEXT NOT NULL,
+    nama_file TEXT NOT NULL,
+    peruntukan TEXT,
+    nominal INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -160,11 +172,34 @@ function getEmployeeBelumAbsenHariIni() {
 
 // ========== REIMBURSE ==========
 
-function buatReimburseBaru(employeeJid, teksAsli) {
+function buatReimburseBaru(employeeJid, peruntukan, nominal) {
   const result = db.prepare(`
-    INSERT INTO reimburse (employee_jid, teks_asli, status) VALUES (?, ?, 'PENDING')
-  `).run(employeeJid, teksAsli);
+    INSERT INTO reimburse (employee_jid, peruntukan, nominal, status) VALUES (?, ?, ?, 'PENDING')
+  `).run(employeeJid, peruntukan, nominal);
   return result.lastInsertRowid;
+}
+
+function buatKwitansiPending(employeeJid, namaFile) {
+  const result = db.prepare(`
+    INSERT INTO kwitansi_pending (employee_jid, nama_file) VALUES (?, ?)
+  `).run(employeeJid, namaFile);
+  return result.lastInsertRowid;
+}
+
+function getKwitansiPendingAktif(employeeJid) {
+  return db.prepare(`
+    SELECT * FROM kwitansi_pending WHERE employee_jid = ? ORDER BY created_at DESC LIMIT 1
+  `).get(employeeJid);
+}
+
+function lengkapiKwitansiPending(id, peruntukan, nominal) {
+  db.prepare(`
+    UPDATE kwitansi_pending SET peruntukan = ?, nominal = ? WHERE id = ?
+  `).run(peruntukan, nominal, id);
+}
+
+function hapusKwitansiPending(id) {
+  db.prepare('DELETE FROM kwitansi_pending WHERE id = ?').run(id);
 }
 
 function setSheetsRowReimburse(id, rowNumber) {
@@ -247,4 +282,10 @@ module.exports = {
   sudahCheckinHariIni,
   getAbsensiHariIni,
   getEmployeeBelumAbsenHariIni,
+
+  // kwitansi pending
+  buatKwitansiPending,
+  getKwitansiPendingAktif,
+  lengkapiKwitansiPending,
+  hapusKwitansiPending,
 };

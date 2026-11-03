@@ -8,11 +8,14 @@ const {
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 
-const { db } = require('./db');
+const { db, seedOwnerAsli, isJidDiizinkan, isOwnerAsli } = require('./db');
 const agent = require('./agent');
 
 const OWNER_JID = process.env.OWNER_JID;
 const MAX_HISTORI = 20;
+
+// Seed owner asli dari .env (sekali, idempotent) sebelum bot mulai terima pesan
+seedOwnerAsli(OWNER_JID);
 
 let sock;
 
@@ -51,9 +54,9 @@ async function startBot() {
 
     const sender = normalizeJid(message);
 
-    // Hanya terima pesan dari owner
-    if (sender !== OWNER_JID) {
-      console.log(`(Pesan dari ${sender} diabaikan, bukan owner)`);
+    // Hanya terima pesan dari nomor yang ada di daftar allowed_user
+    if (!isJidDiizinkan(sender)) {
+      console.log(`(Pesan dari ${sender} diabaikan, nomor tidak diizinkan)`);
       return;
     }
 
@@ -140,8 +143,14 @@ function getChatHistory(jid) {
 async function handleIncomingMessage(jid, text) {
   const historiChat = getChatHistory(jid);
 
-  // jid di-pass ke agent supaya staging preview (pending_parse) ter-scope per pengirim
-  const hasil = await agent.jalankanAgent({ historiChat, pesanBaru: text, jid });
+  // jid di-pass ke agent supaya staging preview (pending_parse) ter-scope per pengirim;
+  // isOwnerAsliPengirim dipakai buat otorisasi tambah/hapus nomor izin
+  const hasil = await agent.jalankanAgent({
+    historiChat,
+    pesanBaru: text,
+    jid,
+    isOwnerAsliPengirim: isOwnerAsli(jid),
+  });
 
   simpanChatHistory(jid, 'user', text);
 

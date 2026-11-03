@@ -1,5 +1,14 @@
 const OpenAI = require('openai');
-const { db, getKlienByNama, simpanStaging, getStaging, hapusStaging } = require('./db');
+const {
+  db,
+  getKlienByNama,
+  simpanStaging,
+  getStaging,
+  hapusStaging,
+  getDaftarAllowedUser,
+  tambahAllowedUser,
+  hapusAllowedUser,
+} = require('./db');
 const {
   parsePesananKlien,
   parseTagihanSupplier,
@@ -404,6 +413,45 @@ const TOOLS = [
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
+
+  // ---------- KELOLA NOMOR YANG BOLEH CHAT ----------
+  {
+    type: 'function',
+    function: {
+      name: 'lihat_daftar_nomor_izin',
+      description: 'Lihat daftar nomor WhatsApp yang diizinkan chat dengan bot ini.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'tambah_nomor_izin',
+      description: 'Tambah nomor WhatsApp baru supaya bisa chat dengan bot ini. HANYA bisa dipanggil oleh owner asli (nomor utama). Kalau yang minta bukan owner asli, tool ini akan otomatis ditolak.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nomor: { type: 'string', description: 'Nomor WhatsApp dalam format JID, misal "6281234567890@s.whatsapp.net". Kalau owner cuma kasih nomor telepon biasa, ubah ke format ini (angka negara+nomor tanpa + atau 0 di depan, lalu tambahkan "@s.whatsapp.net").' },
+          label: { type: 'string', description: 'Opsional, nama/label buat nomor ini biar gampang dikenali, misal "Budi - gudang".' },
+        },
+        required: ['nomor'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'hapus_nomor_izin',
+      description: 'Hapus nomor WhatsApp dari daftar yang diizinkan chat. HANYA bisa dipanggil oleh owner asli. Owner asli sendiri tidak bisa dihapus.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nomor: { type: 'string', description: 'Nomor WhatsApp dalam format JID yang mau dihapus.' },
+        },
+        required: ['nomor'],
+      },
+    },
+  },
 ];
 
 const SYSTEM_PROMPT = `Kamu asisten chat buat owner bisnis distributor sayur/bahan dapur "Harga Petani". Owner jual ke klien (SSB dkk) dan beli dari berbagai supplier secara dinamis.
@@ -429,6 +477,10 @@ EDIT DATA YANG SUDAH TERSIMPAN:
 - Barang yang sebenarnya sama tapi tercatat beda (typo, alias, cth "Sledri" vs "Seledri") digabungkan pakai gabung_alias_barang SETELAH owner eksplisit konfirmasi itu barang yang sama. Jangan panggil ini cuma berdasarkan dugaanmu sendiri.
 - Kalau nama barang ambigu (bisa beberapa varian, misal "cabe rawit merah" bisa Burga atau Burga Petik) dan kamu belum yakin, TANYA owner itu maksudnya varian yang mana. Begitu owner jawab, panggil pilih_varian_barang supaya nama itu otomatis ke-resolve ke varian yang benar di masa depan (tidak perlu nanya lagi).
 
+NOMOR YANG BOLEH CHAT:
+- Kalau owner minta tambah/hapus nomor yang boleh chat dengan bot, pakai tambah_nomor_izin / hapus_nomor_izin. Tool ini otomatis ditolak sistem kalau yang minta bukan owner asli (nomor utama) - kalau ditolak, sampaikan apa adanya ke pengirim, jangan coba akali.
+- Minta format nomor WhatsApp lengkap (atau nomor telepon biasa, nanti kamu konversi ke format JID) sebelum panggil tambah_nomor_izin.
+
 LAIN-LAIN:
 - Kalau owner minta generate dokumen (DO/Invoice/PO), dan dia cuma sebut nama outlet/tanggal tanpa ID pasti, panggil cari_sales_order dulu buat resolve ID-nya. Kalau hasil pencarian ada lebih dari 1 atau 0, tanya balik ke owner, jangan asal pilih.
 - PO ke supplier WAJIB per outlet (setiap barang harus jelas dari outlet mana). Kalau owner belum sebutkan breakdown per outlet, TANYA dulu sebelum panggil buat_purchase_order.
@@ -441,7 +493,7 @@ ATURAN PENULISAN:
 
 // ========== LOOP AGENT ==========
 
-async function jalankanAgent({ historiChat, pesanBaru, jid }) {
+async function jalankanAgent({ historiChat, pesanBaru, jid, isOwnerAsliPengirim = false }) {
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...historiChat,
@@ -489,7 +541,7 @@ async function jalankanAgent({ historiChat, pesanBaru, jid }) {
       let hasilTool;
       try {
         const fungsiEksekutor = EKSEKUTOR[namaFungsi];
-        hasilTool = fungsiEksekutor ? await fungsiEksekutor(argumen, jid) : { error: `Tool ${namaFungsi} tidak dikenali.` };
+        hasilTool = fungsiEksekutor ? await fungsiEksekutor(argumen, jid, isOwnerAsliPengirim) : { error: `Tool ${namaFungsi} tidak dikenali.` };
 
         if (hasilTool && hasilTool.file_path) {
             fileUntukDikirim.push(hasilTool.file_path);
@@ -926,6 +978,34 @@ async function eksekusiPilihVarianBarang({ nama_disebut_owner, nama_atau_id_vari
   };
 }
 
+// ---------- Kelola nomor yang boleh chat ----------
+
+async function eksekusiLihatDaftarNomorIzin() {
+  const daftar = getDaftarAllowedUser();
+  return {
+    sukses: true,
+    daftar: daftar.map((u) => ({ nomor: u.jid, label: u.label, owner_asli: !!u.is_owner_asli })),
+  };
+}
+
+async function eksekusiTambahNomorIzin({ nomor, label }, _jid, isOwnerAsliPengirim) {
+  if (!isOwnerAsliPengirim) {
+    return { sukses: false, pesan: 'Cuma owner asli (nomor utama) yang bisa menambah nomor baru.' };
+  }
+  const hasil = tambahAllowedUser(nomor, label);
+  if (!hasil.sukses) return hasil;
+  return { sukses: true, pesan: `Nomor ${nomor} ditambahkan${label ? ` (${label})` : ''}, sekarang bisa chat dengan bot ini.` };
+}
+
+async function eksekusiHapusNomorIzin({ nomor }, _jid, isOwnerAsliPengirim) {
+  if (!isOwnerAsliPengirim) {
+    return { sukses: false, pesan: 'Cuma owner asli (nomor utama) yang bisa menghapus nomor.' };
+  }
+  const hasil = hapusAllowedUser(nomor);
+  if (!hasil.sukses) return hasil;
+  return { sukses: true, pesan: `Nomor ${nomor} dihapus dari daftar yang diizinkan.` };
+}
+
 const EKSEKUTOR = {
   // preview pesanan
   preview_pesanan_masuk: eksekusiPreviewPesananMasuk,
@@ -958,6 +1038,11 @@ const EKSEKUTOR = {
   cek_kebutuhan_barang: eksekusiCekKebutuhanBarang,
   cek_piutang: eksekusiCekPiutang,
   cek_utang: eksekusiCekUtang,
+
+  // kelola nomor yang boleh chat
+  lihat_daftar_nomor_izin: eksekusiLihatDaftarNomorIzin,
+  tambah_nomor_izin: eksekusiTambahNomorIzin,
+  hapus_nomor_izin: eksekusiHapusNomorIzin,
 };
 
 module.exports = { jalankanAgent };

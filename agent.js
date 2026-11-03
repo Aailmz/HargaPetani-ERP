@@ -313,7 +313,10 @@ async function jalankanAgent({ historiChat, pesanBaru }) {
         hasilTool = fungsiEksekutor ? await fungsiEksekutor(argumen) : { error: `Tool ${namaFungsi} tidak dikenali.` };
 
         if (hasilTool && hasilTool.file_path) {
-          fileUntukDikirim.push(hasilTool.file_path);
+            fileUntukDikirim.push(hasilTool.file_path);
+        }
+        if (hasilTool && hasilTool.file_path_jpg) {
+            fileUntukDikirim.push(hasilTool.file_path_jpg);
         }
       } catch (err) {
         console.error(`❌ Error eksekusi tool ${namaFungsi}:`, err.message);

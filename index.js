@@ -97,6 +97,15 @@ async function kirimPesan(jid, text) {
 
 async function kirimFile(jid, filePath) {
   const namaFile = filePath.split(/[\\/]/).pop();
+  const isJpg = filePath.toLowerCase().endsWith('.jpg') || filePath.toLowerCase().endsWith('.jpeg');
+
+  if (isJpg) {
+    return sock.sendMessage(jid, {
+      image: fs.readFileSync(filePath),
+      caption: '',
+    });
+  }
+
   return sock.sendMessage(jid, {
     document: fs.readFileSync(filePath),
     fileName: namaFile,

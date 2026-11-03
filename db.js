@@ -186,6 +186,19 @@ db.exec(`
   )
 `);
 
+// Nomor-nomor yang boleh chat dengan bot. is_owner_asli membedakan nomor pertama
+// (dari OWNER_JID di .env) yang satu-satunya boleh tambah/hapus nomor lain lewat chat -
+// supaya nomor sekunder tidak bisa menambah dirinya sendiri permanen atau menghapus owner asli.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS allowed_user (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jid TEXT NOT NULL UNIQUE,
+    label TEXT,
+    is_owner_asli INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 // ========== SEED AWAL ==========
 
 function seedAwal() {
@@ -246,6 +259,22 @@ function seedAwal() {
 
 seedAwal();
 
+/**
+ * Seed OWNER_JID dari .env sebagai owner asli (kalau belum ada di tabel allowed_user).
+ * Dipanggil sekali saat bot start, dengan jid dari process.env.OWNER_JID.
+ */
+function seedOwnerAsli(ownerJid) {
+  if (!ownerJid) return;
+  const ada = db.prepare('SELECT id FROM allowed_user WHERE jid = ?').get(ownerJid);
+  if (!ada) {
+    db.prepare('INSERT INTO allowed_user (jid, label, is_owner_asli) VALUES (?, ?, 1)').run(ownerJid, 'Owner (default)');
+    console.log(`✅ Owner asli (${ownerJid}) ditambahkan ke allowed_user`);
+  } else if (!ada.is_owner_asli) {
+    // kalau karena suatu hal sempat kehapus statusnya, pulihkan
+    db.prepare('UPDATE allowed_user SET is_owner_asli = 1 WHERE id = ?').run(ada.id);
+  }
+}
+
 // ========== HELPER QUERIES ==========
 
 function getKlienByNama(nama) {
@@ -298,6 +327,37 @@ function hapusStaging(jid, tipe) {
   db.prepare('DELETE FROM pending_parse WHERE jid = ? AND tipe = ?').run(jid, tipe);
 }
 
+// ---------- Allowed user helpers ----------
+
+function isJidDiizinkan(jid) {
+  const row = db.prepare('SELECT id FROM allowed_user WHERE jid = ?').get(jid);
+  return !!row;
+}
+
+function isOwnerAsli(jid) {
+  const row = db.prepare('SELECT is_owner_asli FROM allowed_user WHERE jid = ?').get(jid);
+  return !!(row && row.is_owner_asli);
+}
+
+function getDaftarAllowedUser() {
+  return db.prepare('SELECT jid, label, is_owner_asli, created_at FROM allowed_user ORDER BY created_at ASC').all();
+}
+
+function tambahAllowedUser(jid, label) {
+  const ada = db.prepare('SELECT id FROM allowed_user WHERE jid = ?').get(jid);
+  if (ada) return { sukses: false, pesan: `Nomor ${jid} sudah ada di daftar.` };
+  db.prepare('INSERT INTO allowed_user (jid, label, is_owner_asli) VALUES (?, ?, 0)').run(jid, label || null);
+  return { sukses: true };
+}
+
+function hapusAllowedUser(jid) {
+  const row = db.prepare('SELECT * FROM allowed_user WHERE jid = ?').get(jid);
+  if (!row) return { sukses: false, pesan: `Nomor ${jid} tidak ada di daftar.` };
+  if (row.is_owner_asli) return { sukses: false, pesan: 'Owner asli tidak bisa dihapus dari daftar.' };
+  db.prepare('DELETE FROM allowed_user WHERE jid = ?').run(jid);
+  return { sukses: true };
+}
+
 module.exports = {
   db,
   getKlienByNama,
@@ -306,4 +366,10 @@ module.exports = {
   simpanStaging,
   getStaging,
   hapusStaging,
+  seedOwnerAsli,
+  isJidDiizinkan,
+  isOwnerAsli,
+  getDaftarAllowedUser,
+  tambahAllowedUser,
+  hapusAllowedUser,
 };

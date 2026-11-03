@@ -1,5 +1,10 @@
 const OpenAI = require('openai');
-const db = require('./db');
+const { db, getKlienByNama } = require('./db');
+const { parsePesananKlien, parseTagihanSupplier, normalisasiNamaBarang, buatBarangBaru, tambahAlias } = require('./parser');
+const { simpanSalesOrder, getSalesOrderDetail, setStatusSalesOrder, cariSalesOrderByOutletTanggal, getSalesOrderHariIni, getTotalKebutuhanBarang } = require('./salesOrder');
+const { generateDO } = require('./generator/deliveryOrder');
+const { generateInvoice } = require('./generator/invoice');
+const { generatePO, setKodeOutlet } = require('./generator/purchaseOrder');
 
 const client = new OpenAI({
   apiKey: process.env.AI_API_KEY,
@@ -7,219 +12,265 @@ const client = new OpenAI({
 });
 
 const MODEL = process.env.AI_MODEL;
-const MAX_TOOL_ITERATIONS = 5;
+const MAX_TOOL_ITERATIONS = 6;
 
-// ========== TOOLS — EMPLOYEE ==========
+// ========== TOOLS ==========
 
-const TOOLS_EMPLOYEE = [
-    {
+const TOOLS = [
+  {
     type: 'function',
     function: {
-      name: 'ajukan_reimburse',
-      description: 'Catat pengajuan reimburse dan teruskan ke operator untuk di-approve/reject. HANYA panggil ini kalau nominal (angka pasti) dan peruntukan (jelas buat apa) SUDAH LENGKAP dari percakapan. Kalau salah satu belum jelas, tanya dulu, jangan panggil tool ini.',
+      name: 'catat_pesanan_masuk',
+      description: 'Parse dan simpan teks pesanan barang dari klien (SSB/outlet) sebagai Sales Order baru. Panggil ini kalau pesan yang diforward owner terlihat seperti pesanan barang (ada Tanggal Pesanan/Outlet/daftar barang+qty).',
       parameters: {
         type: 'object',
         properties: {
-          nominal: {
-            type: 'integer',
-            description: 'Nominal reimburse dalam Rupiah, angka murni (contoh: 50000, bukan "50rb" atau string).',
-          },
-          peruntukan: {
-            type: 'string',
-            description: 'Keterangan singkat buat apa reimburse ini, dirapikan (contoh: "Bensin antar pesanan", bukan kalimat mentah apa adanya).',
-          },
+          teks_pesanan: { type: 'string', description: 'Teks mentah pesanan persis seperti yang diforward owner.' },
         },
-        required: ['nominal', 'peruntukan'],
+        required: ['teks_pesanan'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'cek_status_reimburse_saya',
-      description: 'Lihat status reimburse yang pernah diajukan employee ini (pending/approved/rejected). Dipakai kalau employee nanya soal reimburse yang sudah diajukan sebelumnya.',
+      name: 'catat_tagihan_supplier',
+      description: 'Parse dan simpan teks tagihan dari supplier. Panggil kalau owner forward pesan yang berisi tagihan/invoice dari supplier.',
+      parameters: {
+        type: 'object',
+        properties: {
+          teks_tagihan: { type: 'string', description: 'Teks mentah tagihan dari supplier.' },
+          nama_supplier: { type: 'string', description: 'Nama supplier kalau disebut owner terpisah dari teks tagihan.' },
+        },
+        required: ['teks_tagihan'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'link_tagihan_ke_po',
+      description: 'Kaitkan sebuah tagihan supplier ke purchase order tertentu. Dipakai kalau owner konfirmasi tagihan itu buat PO mana.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tagihan_id: { type: 'integer' },
+          purchase_order_id: { type: 'integer' },
+        },
+        required: ['tagihan_id', 'purchase_order_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buat_delivery_order',
+      description: 'Generate file Excel Delivery Order dari sebuah Sales Order. Panggil kalau owner minta buatkan DO untuk outlet tertentu.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sales_order_id: { type: 'integer', description: 'ID Sales Order. Kalau owner cuma sebut nama outlet+tanggal, cari dulu ID-nya pakai cari_sales_order.' },
+        },
+        required: ['sales_order_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buat_invoice',
+      description: 'Generate file Excel Invoice dari sebuah Sales Order, dihitung pakai harga terbaru. Panggil kalau owner minta buatkan invoice untuk outlet tertentu.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sales_order_id: { type: 'integer' },
+        },
+        required: ['sales_order_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buat_purchase_order',
+      description: 'Generate file Excel Purchase Order ke supplier tertentu. SETIAP item WAJIB menyebutkan outlet asalnya. Kalau owner belum sebutkan outlet untuk suatu barang, TANYA dulu, jangan panggil tool ini.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nama_supplier: { type: 'string' },
+          tanggal: { type: 'string', description: 'Format YYYY-MM-DD, default hari ini kalau tidak disebut.' },
+          label_kategori: { type: 'string', description: 'Opsional, label kategori/brand di atas nama supplier kalau owner sebutkan.' },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                nama_barang: { type: 'string' },
+                qty: { type: 'number' },
+                uom: { type: 'string' },
+                nama_outlet: { type: 'string', description: 'WAJIB diisi, outlet asal permintaan barang ini.' },
+              },
+              required: ['nama_barang', 'qty', 'nama_outlet'],
+            },
+          },
+        },
+        required: ['nama_supplier', 'items'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_kode_outlet',
+      description: 'Set kode singkatan manual untuk sebuah outlet (dipakai di dokumen PO). Panggil kalau owner kasih tau kode tertentu buat outlet, misal "kode outlet Sukatani itu ST".',
+      parameters: {
+        type: 'object',
+        properties: {
+          nama_outlet: { type: 'string' },
+          kode: { type: 'string' },
+        },
+        required: ['nama_outlet', 'kode'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_harga_barang',
+      description: 'Update harga jual sebuah barang ke klien (harga terbaru akan dipakai untuk invoice berikutnya). Histori harga lama tetap tersimpan.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nama_barang: { type: 'string' },
+          harga_baru: { type: 'integer' },
+        },
+        required: ['nama_barang', 'harga_baru'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_status_sales_order',
+      description: 'Update status sebuah Sales Order (misal owner bilang barang sudah diterima SSB).',
+      parameters: {
+        type: 'object',
+        properties: {
+          sales_order_id: { type: 'integer' },
+          status: { type: 'string', enum: ['BARU', 'DIKIRIM', 'DITERIMA', 'INVOICED', 'LUNAS'] },
+        },
+        required: ['sales_order_id', 'status'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_status_bayar_invoice',
+      description: 'Tandai sebuah invoice sudah lunas atau belum. Dipakai kalau owner bilang SSB sudah/belum bayar.',
+      parameters: {
+        type: 'object',
+        properties: {
+          invoice_id: { type: 'integer' },
+          status: { type: 'string', enum: ['BELUM_LUNAS', 'LUNAS'] },
+        },
+        required: ['invoice_id', 'status'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_status_bayar_tagihan',
+      description: 'Tandai sebuah tagihan supplier sudah lunas atau belum.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tagihan_id: { type: 'integer' },
+          status: { type: 'string', enum: ['BELUM_LUNAS', 'LUNAS'] },
+        },
+        required: ['tagihan_id', 'status'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cari_sales_order',
+      description: 'Cari Sales Order berdasarkan nama outlet dan/atau tanggal. Dipakai buat resolve ID sebelum buat DO/invoice/update status kalau owner cuma sebut nama outlet.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nama_outlet: { type: 'string' },
+          tanggal: { type: 'string', description: 'Format YYYY-MM-DD' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cek_kebutuhan_barang',
+      description: 'Lihat total kebutuhan tiap barang (gabungan semua outlet) di tanggal tertentu. Dipakai owner buat lihat dulu sebelum alokasi PO ke supplier.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tanggal: { type: 'string', description: 'Format YYYY-MM-DD, default hari ini.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cek_piutang',
+      description: 'Lihat daftar invoice yang belum lunas (piutang ke SSB/klien).',
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'cek_status_absen_saya',
-      description: 'Cek apakah employee ini sudah check-in/absen hari ini atau belum, beserta jam berapa kalau sudah.',
+      name: 'cek_utang',
+      description: 'Lihat daftar tagihan supplier yang belum lunas (utang ke supplier).',
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
 ];
 
-const TOOLS_OPERATOR = [
-  {
-    type: 'function',
-    function: {
-      name: 'lihat_reimburse_pending',
-      description: 'Lihat daftar reimburse yang masih menunggu approval. Dipakai kalau operator tanya ada reimburse apa aja yang pending.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'approve_reimburse',
-      description: 'Setujui sebuah reimburse. Dipakai kalau operator bilang oke/approve/acc untuk reimburse tertentu.',
-      parameters: {
-        type: 'object',
-        properties: {
-          reimburse_id: {
-            type: 'integer',
-            description: 'ID reimburse yang mau di-approve. Ambil dari konteks chat (nomor yang disebut, atau reimburse yang baru dibahas).',
-          },
-        },
-        required: ['reimburse_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'reject_reimburse',
-      description: 'Tolak sebuah reimburse. Dipakai kalau operator bilang tolak/reject untuk reimburse tertentu.',
-      parameters: {
-        type: 'object',
-        properties: {
-          reimburse_id: {
-            type: 'integer',
-            description: 'ID reimburse yang mau ditolak.',
-          },
-          alasan: {
-            type: 'string',
-            description: 'Alasan penolakan, untuk disampaikan ke karyawan.',
-          },
-        },
-        required: ['reimburse_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'lihat_semua_employee',
-      description: 'Lihat daftar semua karyawan yang terdaftar beserta posisinya. Dipakai kalau operator tanya ada karyawan siapa aja.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cari_employee',
-      description: 'Cari karyawan berdasarkan nama atau posisi. Dipakai kalau operator sebut nama karyawan tapi tidak ada nomor WA-nya di konteks.',
-      parameters: {
-        type: 'object',
-        properties: {
-          kata_kunci: {
-            type: 'string',
-            description: 'Kata kunci pencarian, nama atau posisi karyawan.',
-          },
-        },
-        required: ['kata_kunci'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'lihat_histori_chat_employee',
-      description: 'Lihat histori chat seorang karyawan dengan bot. Dipakai kalau operator mau tau apa yang sudah dibahas karyawan tertentu.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nomor: {
-            type: 'string',
-            description: 'Nomor WA karyawan, format angka saja.',
-          },
-        },
-        required: ['nomor'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'lengkapi_kwitansi',
-      description: 'Lengkapi data kwitansi yang baru diupload (foto sudah masuk, tapi nominal/peruntukan belum jelas). HANYA panggil ini kalau ada kwitansi yang sedang menunggu kelengkapan data DAN kedua info (nominal + peruntukan) sudah bisa dipastikan dari pesan employee sekarang.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nominal: {
-            type: 'integer',
-            description: 'Nominal di kwitansi, angka murni.',
-          },
-          peruntukan: {
-            type: 'string',
-            description: 'Keterangan singkat kwitansi ini buat apa, dirapikan.',
-          },
-        },
-        required: ['nominal', 'peruntukan'],
-      },
-    },
-  },
-];
-
-const SYSTEM_PROMPT_OPERATOR = `Kamu adalah asisten kerja buat operator ERP internal "Harga Petani". Operator ini rekan kerja yang kamu bantu urus approval reimburse & data karyawan.
+const SYSTEM_PROMPT = `Kamu asisten chat buat owner bisnis distributor sayur/bahan dapur "Harga Petani". Owner jual ke klien (SSB dkk) dan beli dari berbagai supplier secara dinamis.
 
 Gaya bicaramu:
-- Langsung, efisien, seperti asisten yang paham kerjaan, bukan formal kaku.
-- Boleh santai/informal khas chat kerja sehari-hari.
+- Santai, efisien, seperti asisten kerja yang paham konteks, bukan formal kaku.
+- Jangan sebut dirimu "AI"/"bot"/"sistem".
+- Jawaban singkat, langsung ke poin.
 
 CARA KERJA:
-- Operator bisa minta apapun soal approval reimburse, lihat data karyawan, cek histori chat karyawan tertentu.
-- Kalau operator sebut "yang tadi"/"reimburse barusan" tanpa nomor jelas, cari dari histori chat reimburse mana yang dimaksud. Kalau ambigu, tanya balik, jangan asal nebak.
-- Kalau operator sebut nama karyawan tapi bukan nomor, panggil cari_employee dulu sebelum tool lain yang butuh nomor.
-- Setelah tool jalan, sampaikan hasilnya natural, bukan data mentah.
+- Kalau owner forward teks yang keliatannya pesanan outlet (ada Tanggal Pesanan/Outlet/daftar barang+qty), panggil catat_pesanan_masuk dengan teks itu persis.
+- Kalau owner forward teks yang keliatannya tagihan dari supplier, panggil catat_tagihan_supplier.
+- Kalau owner minta generate dokumen (DO/Invoice/PO), dan dia cuma sebut nama outlet/tanggal tanpa ID pasti, panggil cari_sales_order dulu buat resolve ID-nya. Kalau hasil pencarian ada lebih dari 1 atau 0, tanya balik ke owner, jangan asal pilih.
+- PO ke supplier WAJIB per outlet (setiap barang harus jelas dari outlet mana). Kalau owner belum sebutkan breakdown per outlet, TANYA dulu sebelum panggil buat_purchase_order.
+- Barang baru yang otomatis tercatat saat parsing (nama tidak dikenal sebelumnya) akan diinfokan ke kamu lewat hasil tool — sampaikan ke owner biar dia sadar, tanya kalau itu sebenarnya sama dengan barang lain yang sudah ada (biar bisa digabung jadi alias).
+- Barang yang invoice-nya kena harga 0 (belum ada harga di-set) akan diinfokan juga — selalu kasih tau owner, jangan diam-diam.
+- Setelah tool jalan, sampaikan hasil secara natural, bukan dump data mentah/JSON.
 
 ATURAN PENULISAN:
 - Kapitalisasi normal, bukan Title Case tiap kata.
-- Jangan sebut dirimu "AI"/"bot"/"sistem".
-- Jawaban singkat, maksimal 2-4 kalimat kecuali perlu daftar (pakai format angka 1. 2. 3., bukan bullet/strip).
 - Jangan pakai tanda strip panjang (—) atau double dash (--).`;
 
-const SYSTEM_PROMPT_EMPLOYEE = `Kamu adalah asisten internal "Harga Petani" buat bantu karyawan (driver, marketing, dll) urus hal operasional sehari-hari: reimburse, check-in, lapor foto bukti jalan/kwitansi.
+// ========== LOOP AGENT ==========
 
-Gaya bicaramu:
-- Santai, natural, seperti rekan kerja ngobrol di WA, bukan robot yang jawab template.
-- Jangan sebut dirimu "AI"/"bot"/"sistem".
-- Boleh nanggepin basa-basi/update kerjaan karyawan dengan natural, TANPA harus selalu ngasih instruksi/panduan balik kalau tidak relevan/tidak diminta.
-
-CARA KERJA REIMBURSE (PENTING, DATA HARUS LENGKAP):
-- Reimburse WAJIB ada 2 data pasti: nominal (angka jelas dalam Rupiah) dan peruntukan (jelas buat apa).
-- Kalau karyawan baru kasih salah satu, atau nominalnya nggak jelas (misal "sekitar 50rb-an"), TANYAKAN yang kurang/minta kepastian angka dulu. JANGAN panggil tool ajukan_reimburse sebelum dua-duanya pasti.
-- Convert semua bentuk nominal ("goceng", "50rb", "lima puluh ribu") ke angka murni Rupiah.
-- Kalau ambigu (koreksi vs pengajuan baru, atau jelas bercanda), tanya SATU pertanyaan simpel buat klarifikasi.
-- Begitu dua data lengkap dan pasti, langsung panggil tool ajukan_reimburse, jangan tanya ulang konfirmasi.
-- Kalau karyawan batal SEBELUM tool dipanggil, konfirmasi oke dibatalkan, tidak perlu panggil tool.
-
-CARA KERJA KWITANSI YANG BELUM LENGKAP:
-- Kalau ada notice "KWITANSI MENUNGGU KELENGKAPAN" di konteks, itu artinya karyawan baru upload foto kwitansi tapi nominal/peruntukannya belum jelas dari caption. Pesan karyawan SEKARANG kemungkinan adalah jawaban susulan buat melengkapi itu.
-- Begitu nominal dan peruntukan kwitansi itu jelas dari pesan karyawan, panggil tool lengkapi_kwitansi.
-- Kalau masih belum jelas, tanya lagi sampai pasti.
-
-CARA KERJA LAIN:
-- Kalau karyawan tanya status reimburse, panggil cek_status_reimburse_saya.
-- Kalau karyawan tanya status absen hari ini, panggil cek_status_absen_saya.
-- Kalau karyawan cuma nanya cara pakai, jawab langsung: check-in = share location, lapor foto = kirim foto + keterangan jelas (nominal+peruntukan) di caption, reimburse = chat aja sebutkan keperluan + nominal.
-- Kalau cuma chat biasa/update kerjaan/basa-basi yang tidak butuh aksi, balas natural secukupnya.
-
-ATURAN PENULISAN:
-- Kapitalisasi normal, bukan Title Case tiap kata.
-- Jawaban singkat natural, 1-3 kalimat.
-- Jangan pakai tanda strip panjang (—) atau double dash (--).`;
-
-async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, eksekutorTools, konteks }) {
+async function jalankanAgent({ historiChat, pesanBaru }) {
   const messages = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: SYSTEM_PROMPT },
     ...historiChat,
     { role: 'user', content: pesanBaru },
   ];
 
   let iterasi = 0;
+  let fileUntukDikirim = []; // kumpulkan file_path dari tool generate dokumen
 
   while (iterasi < MAX_TOOL_ITERATIONS) {
     iterasi++;
@@ -229,20 +280,20 @@ async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, ekse
       completion = await client.chat.completions.create({
         model: MODEL,
         messages,
-        tools,
+        tools: TOOLS,
         tool_choice: 'auto',
-        temperature: 0.5,
+        temperature: 0.3,
       });
     } catch (err) {
       console.error('❌ Agent API error:', err.message);
-      return { jawabanFinal: null, error: err.message };
+      return { jawabanFinal: null, error: err.message, files: [] };
     }
 
     const pesanAi = completion.choices[0].message;
     messages.push(pesanAi);
 
     if (!pesanAi.tool_calls || pesanAi.tool_calls.length === 0) {
-      return { jawabanFinal: pesanAi.content, error: null };
+      return { jawabanFinal: pesanAi.content, error: null, files: fileUntukDikirim };
     }
 
     for (const toolCall of pesanAi.tool_calls) {
@@ -258,10 +309,12 @@ async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, ekse
 
       let hasilTool;
       try {
-        const fungsiEksekutor = eksekutorTools[namaFungsi];
-        hasilTool = fungsiEksekutor
-          ? await fungsiEksekutor(argumen, konteks)
-          : { error: `Tool ${namaFungsi} tidak dikenali.` };
+        const fungsiEksekutor = EKSEKUTOR[namaFungsi];
+        hasilTool = fungsiEksekutor ? await fungsiEksekutor(argumen) : { error: `Tool ${namaFungsi} tidak dikenali.` };
+
+        if (hasilTool && hasilTool.file_path) {
+          fileUntukDikirim.push(hasilTool.file_path);
+        }
       } catch (err) {
         console.error(`❌ Error eksekusi tool ${namaFungsi}:`, err.message);
         hasilTool = { error: `Gagal eksekusi: ${err.message}` };
@@ -276,211 +329,243 @@ async function jalankanAgent({ systemPrompt, tools, historiChat, pesanBaru, ekse
   }
 
   console.log('⚠️  Agent mencapai batas iterasi maksimal.');
-  return { jawabanFinal: 'Maaf, ada kendala teknis. Boleh diulang permintaannya?', error: 'MAX_ITERATIONS' };
+  return { jawabanFinal: 'Ada kendala teknis, boleh diulang?', error: 'MAX_ITERATIONS', files: fileUntukDikirim };
 }
 
-// ========== EKSEKUTOR — EMPLOYEE ==========
+// ========== EKSEKUTOR TOOL ==========
 
-async function eksekusiAjukanReimburse({ nominal, peruntukan }, konteks) {
-  const { db: dbModule, appendRow, formatWaktu } = konteks;
-  const employee = dbModule.getEmployee(konteks.jid);
-  const waktu = formatWaktu();
-
-  const reimburseId = dbModule.buatReimburseBaru(konteks.jid, peruntukan, nominal);
-
-  await konteks.kirimPesan(
-    process.env.OPERATOR_JID,
-    `💰 Reimburse baru\nDari: ${employee.nama} (${konteks.jid.split('@')[0]})\nPeruntukan: ${peruntukan}\nNominal: Rp${nominal.toLocaleString('id-ID')}\n\n[reimburse #${reimburseId}]`
-  );
-
-  try {
-    const row = await appendRow('Reimburse', [
-      employee.nama, konteks.jid.split('@')[0], waktu, peruntukan, nominal, 'PENDING', ''
-    ]);
-    dbModule.setSheetsRowReimburse(reimburseId, row);
-  } catch (err) {
-    console.error('⚠️  Gagal catat Reimburse ke Sheets:', err.message);
-  }
-
-  return { sukses: true, reimburse_id: reimburseId, pesan: 'Reimburse berhasil diajukan dan diteruskan ke tim.' };
+async function eksekusiCatatPesananMasuk({ teks_pesanan }) {
+  const parsed = await parsePesananKlien(teks_pesanan);
+  if (!parsed) return { sukses: false, pesan: 'Gagal parse teks pesanan, format mungkin tidak dikenali.' };
+  return simpanSalesOrder(parsed, teks_pesanan);
 }
 
-async function eksekusiLengkapiKwitansi({ nominal, peruntukan }, konteks) {
-  const { db: dbModule, appendRow, formatWaktu } = konteks;
-  const pending = dbModule.getKwitansiPendingAktif(konteks.jid);
-
-  if (!pending) {
-    return { sukses: false, pesan: 'Tidak ada kwitansi yang sedang menunggu kelengkapan data.' };
+async function eksekusiCatatTagihanSupplier({ teks_tagihan, nama_supplier }) {
+  const parsed = await parseTagihanSupplier(teks_tagihan);
+  if (!parsed || !parsed.nominal) {
+    return { sukses: false, pesan: 'Gagal extract nominal dari teks tagihan.' };
   }
 
-  const employee = dbModule.getEmployee(konteks.jid);
-  const waktu = formatWaktu();
-
-  try {
-    await appendRow('Kwitansi', [employee.nama, konteks.jid.split('@')[0], waktu, peruntukan, nominal, pending.nama_file]);
-  } catch (err) {
-    console.error('⚠️  Gagal catat Kwitansi ke Sheets:', err.message);
+  const namaSupplierFinal = nama_supplier || parsed.supplier;
+  if (!namaSupplierFinal) {
+    return { sukses: false, pesan: 'Nama supplier tidak terdeteksi, sebutkan nama supplier-nya.' };
   }
 
-  dbModule.hapusKwitansiPending(pending.id);
-
-  return { sukses: true, pesan: 'Kwitansi sudah lengkap dan tercatat.' };
-}
-
-async function eksekusiCekStatusReimburseSaya(_, konteks) {
-  const semua = konteks.db.db.prepare(`
-    SELECT * FROM reimburse WHERE employee_jid = ? ORDER BY created_at DESC LIMIT 5
-  `).all(konteks.jid);
-
-  if (semua.length === 0) {
-    return { sukses: true, jumlah: 0, pesan: 'Belum ada reimburse yang pernah diajukan.' };
+  let supplier = db.prepare('SELECT * FROM supplier WHERE nama = ?').get(namaSupplierFinal);
+  if (!supplier) {
+    const id = db.prepare('INSERT INTO supplier (nama) VALUES (?)').run(namaSupplierFinal).lastInsertRowid;
+    supplier = db.prepare('SELECT * FROM supplier WHERE id = ?').get(id);
   }
+
+  const tanggal = parsed.tanggal || new Date().toISOString().split('T')[0];
+  const result = db.prepare(`
+    INSERT INTO tagihan_supplier (supplier_id, nominal, keterangan, status, teks_asli)
+    VALUES (?, ?, ?, 'BELUM_LUNAS', ?)
+  `).run(supplier.id, parsed.nominal, parsed.keterangan || null, teks_tagihan);
 
   return {
     sukses: true,
-    jumlah: semua.length,
-    daftar: semua.map((r) => ({
-      id: r.id, peruntukan: r.peruntukan, nominal: r.nominal, status: r.status, alasan_reject: r.alasan_reject,
-    })),
+    tagihan_id: result.lastInsertRowid,
+    supplier: supplier.nama,
+    nominal: parsed.nominal,
+    pesan: `Tagihan dari ${supplier.nama} sebesar Rp${parsed.nominal.toLocaleString('id-ID')} tercatat. Mau dikaitkan ke PO mana?`,
   };
 }
 
-async function eksekusiCekStatusAbsenSaya(_, konteks) {
-  const absenHariIni = konteks.db.getAbsensiHariIni(konteks.jid);
+async function eksekusiLinkTagihanKePo({ tagihan_id, purchase_order_id }) {
+  const tagihan = db.prepare('SELECT * FROM tagihan_supplier WHERE id = ?').get(tagihan_id);
+  const po = db.prepare('SELECT * FROM purchase_order WHERE id = ?').get(purchase_order_id);
+  if (!tagihan) return { sukses: false, pesan: `Tagihan #${tagihan_id} tidak ditemukan.` };
+  if (!po) return { sukses: false, pesan: `PO #${purchase_order_id} tidak ditemukan.` };
 
-  if (absenHariIni.length === 0) {
-    return { sukses: true, sudah_absen: false, pesan: 'Belum absen hari ini.' };
-  }
-
-  return {
-    sukses: true,
-    sudah_absen: true,
-    jumlah_checkin: absenHariIni.length,
-    jam_pertama: absenHariIni[0].created_at_display,
-  };
+  db.prepare('UPDATE tagihan_supplier SET purchase_order_id = ? WHERE id = ?').run(purchase_order_id, tagihan_id);
+  return { sukses: true, pesan: `Tagihan #${tagihan_id} dikaitkan ke PO #${purchase_order_id}.` };
 }
 
-const EKSEKUTOR_EMPLOYEE = {
-  ajukan_reimburse: eksekusiAjukanReimburse,
-  cek_status_reimburse_saya: eksekusiCekStatusReimburseSaya,
-  cek_status_absen_saya: eksekusiCekStatusAbsenSaya,
-  lengkapi_kwitansi: eksekusiLengkapiKwitansi,
-};
-
-async function eksekusiLihatReimbursePending(_, konteks) {
-  const pending = konteks.db.getReimbursePendingTerbaru(20);
-
-  if (pending.length === 0) {
-    return { sukses: true, jumlah: 0, pesan: 'Tidak ada reimburse yang pending saat ini.' };
-  }
-
-  return {
-    sukses: true,
-    jumlah: pending.length,
-    daftar: pending.map((r) => {
-      const emp = konteks.db.getEmployee(r.employee_jid);
-      return { id: r.id, nama: emp.nama, peruntukan: r.peruntukan, nominal: r.nominal };
-    }),
-  };
+async function eksekusiBuatDeliveryOrder({ sales_order_id }) {
+  return generateDO(sales_order_id);
 }
 
-async function prosesKeputusanReimburse(reimburseId, statusBaru, alasan, konteks) {
-  const reimburse = konteks.db.getReimburseById(reimburseId);
+async function eksekusiBuatInvoice({ sales_order_id }) {
+  const hasil = await generateInvoice(sales_order_id);
+  if (hasil.sukses) setStatusSalesOrder(sales_order_id, 'INVOICED');
+  return hasil;
+}
 
-  if (!reimburse) {
-    return { sukses: false, pesan: `Reimburse #${reimburseId} tidak ditemukan.` };
+async function eksekusiBuatPurchaseOrder({ nama_supplier, tanggal, label_kategori, items }) {
+  let supplier = db.prepare('SELECT * FROM supplier WHERE nama = ?').get(nama_supplier);
+  if (!supplier) {
+    const id = db.prepare('INSERT INTO supplier (nama) VALUES (?)').run(nama_supplier).lastInsertRowid;
+    supplier = db.prepare('SELECT * FROM supplier WHERE id = ?').get(id);
   }
-  if (reimburse.status !== 'PENDING') {
-    return { sukses: false, pesan: `Reimburse #${reimburseId} sudah berstatus ${reimburse.status}, tidak bisa diubah lagi.` };
-  }
 
-  konteks.db.setStatusReimburse(reimburseId, statusBaru, alasan || null);
-  const waktuUpdate = konteks.formatWaktu();
+  const klien = getKlienByNama('SSB');
+  const itemsResolved = [];
 
-  if (reimburse.sheets_row) {
-    try {
-      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'F', statusBaru);
-      await konteks.updateCell('Reimburse', reimburse.sheets_row, 'G', waktuUpdate);
-    } catch (err) {
-      console.error('⚠️  Gagal update status Reimburse ke Sheets:', err.message);
+  for (const item of items) {
+    let barang = normalisasiNamaBarang(item.nama_barang);
+    if (!barang) barang = buatBarangBaru(item.nama_barang, item.uom || null);
+
+    const outlet = db.prepare(`
+      SELECT * FROM outlet WHERE klien_id = ? AND nama LIKE ?
+    `).get(klien.id, `%${item.nama_outlet}%`);
+
+    if (!outlet) {
+      return { sukses: false, pesan: `Outlet "${item.nama_outlet}" tidak ditemukan, sebutkan nama outlet yang benar.` };
     }
+
+    itemsResolved.push({
+      nama_barang: barang.nama,
+      barang_id: barang.id,
+      qty: item.qty,
+      uom: item.uom || barang.satuan_default,
+      outlet_nama: outlet.nama,
+      outlet_id: outlet.id,
+    });
   }
 
-  const employee = konteks.db.getEmployee(reimburse.employee_jid);
-  const pesanNotif = statusBaru === 'APPROVED'
-    ? `Reimburse kamu udah di-ACC ya 👍\n${reimburse.peruntukan}: Rp${reimburse.nominal.toLocaleString('id-ID')}`
-    : `Reimburse kamu ditolak${alasan ? `: ${alasan}` : ''}.\n${reimburse.peruntukan}: Rp${reimburse.nominal.toLocaleString('id-ID')}`;
-
-  await konteks.kirimPesan(reimburse.employee_jid, pesanNotif);
-
-  return { sukses: true, reimburse_id: reimburseId, nama: employee.nama, status: statusBaru };
+  return generatePO({
+    supplierId: supplier.id,
+    supplierNama: supplier.nama,
+    tanggal: tanggal || new Date().toISOString().split('T')[0],
+    items: itemsResolved,
+    labelKategori: label_kategori,
+  });
 }
 
-async function eksekusiApproveReimburse({ reimburse_id }, konteks) {
-  return prosesKeputusanReimburse(reimburse_id, 'APPROVED', null, konteks);
+async function eksekusiSetKodeOutlet({ nama_outlet, kode }) {
+  const klien = getKlienByNama('SSB');
+  const outlet = db.prepare('SELECT * FROM outlet WHERE klien_id = ? AND nama LIKE ?').get(klien.id, `%${nama_outlet}%`);
+  if (!outlet) return { sukses: false, pesan: `Outlet "${nama_outlet}" tidak ditemukan.` };
+
+  setKodeOutlet(outlet.id, kode);
+  return { sukses: true, pesan: `Kode outlet ${outlet.nama} di-set jadi "${kode.toUpperCase()}".` };
 }
 
-async function eksekusiRejectReimburse({ reimburse_id, alasan }, konteks) {
-  return prosesKeputusanReimburse(reimburse_id, 'REJECTED', alasan, konteks);
+async function eksekusiUpdateHargaBarang({ nama_barang, harga_baru }) {
+  const barang = normalisasiNamaBarang(nama_barang);
+  if (!barang) return { sukses: false, pesan: `Barang "${nama_barang}" tidak ditemukan.` };
+
+  const klien = getKlienByNama('SSB');
+  db.prepare('INSERT INTO harga (klien_id, barang_id, harga) VALUES (?, ?, ?)').run(klien.id, barang.id, harga_baru);
+
+  return { sukses: true, pesan: `Harga ${barang.nama} di-update jadi Rp${harga_baru.toLocaleString('id-ID')}.` };
 }
 
-async function eksekusiLihatSemuaEmployee(_, konteks) {
-  const semua = konteks.db.getAllEmployees();
-  return {
-    sukses: true,
-    jumlah: semua.length,
-    daftar: semua.map((e) => ({ nama: e.nama, posisi: e.posisi, nomor: e.jid.split('@')[0] })),
-  };
+async function eksekusiUpdateStatusSalesOrder({ sales_order_id, status }) {
+  const so = getSalesOrderDetail(sales_order_id);
+  if (!so) return { sukses: false, pesan: `Sales Order #${sales_order_id} tidak ditemukan.` };
+
+  setStatusSalesOrder(sales_order_id, status);
+  return { sukses: true, pesan: `Status Sales Order ${so.outlet_nama} (#${sales_order_id}) jadi ${status}.` };
 }
 
-async function eksekusiCariEmployee({ kata_kunci }, konteks) {
-  const pola = `%${kata_kunci}%`;
-  const hasil = konteks.db.db.prepare(`
-    SELECT * FROM employees WHERE is_registered = 1 AND (nama LIKE ? OR posisi LIKE ?) LIMIT 10
-  `).all(pola, pola);
+async function eksekusiUpdateStatusBayarInvoice({ invoice_id, status }) {
+  const invoice = db.prepare('SELECT * FROM invoice WHERE id = ?').get(invoice_id);
+  if (!invoice) return { sukses: false, pesan: `Invoice #${invoice_id} tidak ditemukan.` };
 
-  if (hasil.length === 0) {
-    return { sukses: false, pesan: `Tidak ada karyawan yang cocok dengan "${kata_kunci}".` };
+  db.prepare('UPDATE invoice SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), invoice_id);
+  if (status === 'LUNAS') setStatusSalesOrder(invoice.sales_order_id, 'LUNAS');
+
+  return { sukses: true, pesan: `Invoice #${invoice_id} di-update jadi ${status}.` };
+}
+
+async function eksekusiUpdateStatusBayarTagihan({ tagihan_id, status }) {
+  const tagihan = db.prepare('SELECT * FROM tagihan_supplier WHERE id = ?').get(tagihan_id);
+  if (!tagihan) return { sukses: false, pesan: `Tagihan #${tagihan_id} tidak ditemukan.` };
+
+  db.prepare('UPDATE tagihan_supplier SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), tagihan_id);
+  return { sukses: true, pesan: `Tagihan #${tagihan_id} di-update jadi ${status}.` };
+}
+
+async function eksekusiCariSalesOrder({ nama_outlet, tanggal }) {
+  const tgl = tanggal || new Date().toISOString().split('T')[0];
+  let hasil;
+  if (nama_outlet) {
+    hasil = cariSalesOrderByOutletTanggal(nama_outlet, tgl);
+  } else {
+    hasil = getSalesOrderHariIni(tgl);
   }
+
+  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada Sales Order yang cocok.' };
 
   return {
     sukses: true,
     jumlah: hasil.length,
-    daftar: hasil.map((e) => ({ nama: e.nama, posisi: e.posisi, nomor: e.jid.split('@')[0] })),
+    daftar: hasil.map((so) => ({ id: so.id, outlet: so.outlet_nama || so.outlet_id, tanggal: so.tanggal_pesanan, status: so.status })),
   };
 }
 
-async function eksekusiLihatHistoriChatEmployee({ nomor }, konteks) {
-  const jid = `${nomor.replace(/\D/g, '')}@s.whatsapp.net`;
-  const employee = konteks.db.getEmployee(jid);
-  const histori = konteks.db.getChatHistory(jid);
+async function eksekusiCekKebutuhanBarang({ tanggal }) {
+  const tgl = tanggal || new Date().toISOString().split('T')[0];
+  const hasil = getTotalKebutuhanBarang(tgl);
 
-  if (histori.length === 0) {
-    return { sukses: true, jumlah: 0, pesan: `Belum ada histori chat untuk ${employee.nama || nomor}.` };
-  }
+  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: `Belum ada pesanan tanggal ${tgl}.` };
 
   return {
     sukses: true,
-    nama: employee.nama,
-    histori: histori.map((h) => `[${h.role === 'user' ? 'karyawan' : 'bot'}] ${h.content}`),
+    tanggal: tgl,
+    daftar: hasil.map((h) => ({ barang: h.barang_nama, total_qty: h.total_qty, uom: h.uom })),
   };
 }
 
-const EKSEKUTOR_OPERATOR = {
-  lihat_reimburse_pending: eksekusiLihatReimbursePending,
-  approve_reimburse: eksekusiApproveReimburse,
-  reject_reimburse: eksekusiRejectReimburse,
-  lihat_semua_employee: eksekusiLihatSemuaEmployee,
-  cari_employee: eksekusiCariEmployee,
-  lihat_histori_chat_employee: eksekusiLihatHistoriChatEmployee,
+async function eksekusiCekPiutang() {
+  const hasil = db.prepare(`
+    SELECT i.*, o.nama as outlet_nama
+    FROM invoice i
+    JOIN sales_order so ON so.id = i.sales_order_id
+    JOIN outlet o ON o.id = so.outlet_id
+    WHERE i.status = 'BELUM_LUNAS'
+    ORDER BY i.created_at ASC
+  `).all();
+
+  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada piutang, semua invoice sudah lunas.' };
+
+  const total = hasil.reduce((sum, i) => sum + i.total, 0);
+  return {
+    sukses: true,
+    jumlah: hasil.length,
+    total_piutang: total,
+    daftar: hasil.map((i) => ({ invoice_id: i.id, outlet: i.outlet_nama, total: i.total })),
+  };
+}
+
+async function eksekusiCekUtang() {
+  const hasil = db.prepare(`
+    SELECT ts.*, s.nama as supplier_nama
+    FROM tagihan_supplier ts
+    JOIN supplier s ON s.id = ts.supplier_id
+    WHERE ts.status = 'BELUM_LUNAS'
+    ORDER BY ts.created_at ASC
+  `).all();
+
+  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada utang, semua tagihan sudah lunas.' };
+
+  const total = hasil.reduce((sum, t) => sum + t.nominal, 0);
+  return {
+    sukses: true,
+    jumlah: hasil.length,
+    total_utang: total,
+    daftar: hasil.map((t) => ({ tagihan_id: t.id, supplier: t.supplier_nama, nominal: t.nominal })),
+  };
+}
+
+const EKSEKUTOR = {
+  catat_pesanan_masuk: eksekusiCatatPesananMasuk,
+  catat_tagihan_supplier: eksekusiCatatTagihanSupplier,
+  link_tagihan_ke_po: eksekusiLinkTagihanKePo,
+  buat_delivery_order: eksekusiBuatDeliveryOrder,
+  buat_invoice: eksekusiBuatInvoice,
+  buat_purchase_order: eksekusiBuatPurchaseOrder,
+  set_kode_outlet: eksekusiSetKodeOutlet,
+  update_harga_barang: eksekusiUpdateHargaBarang,
+  update_status_sales_order: eksekusiUpdateStatusSalesOrder,
+  update_status_bayar_invoice: eksekusiUpdateStatusBayarInvoice,
+  update_status_bayar_tagihan: eksekusiUpdateStatusBayarTagihan,
+  cari_sales_order: eksekusiCariSalesOrder,
+  cek_kebutuhan_barang: eksekusiCekKebutuhanBarang,
+  cek_piutang: eksekusiCekPiutang,
+  cek_utang: eksekusiCekUtang,
 };
 
-module.exports = {
-  TOOLS_EMPLOYEE,
-  SYSTEM_PROMPT_EMPLOYEE,
-  EKSEKUTOR_EMPLOYEE,
-  TOOLS_OPERATOR,
-  SYSTEM_PROMPT_OPERATOR,
-  EKSEKUTOR_OPERATOR,
-  jalankanAgent,
-};
+module.exports = { jalankanAgent };

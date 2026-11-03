@@ -4,6 +4,8 @@ const fs = require('fs');
 const { getSalesOrderDetail } = require('../salesOrder');
 const { getHargaTerbaru } = require('../db');
 const { formatTanggalIndo } = require('./deliveryOrder');
+const { renderHtmlToJpg } = require('./renderImage');
+const { templateInvoice } = require('./templates');
 
 const WARNA_HIJAU = 'FF92D050';
 const FOLDER_OUTPUT = path.join(__dirname, '..', 'output', 'invoice');
@@ -145,14 +147,25 @@ async function generateInvoice(salesOrderId) {
     insertInvoiceItem.run(invoiceId, item.barang_id, item.qty, item.uom, item.harga_satuan, item.subtotal);
   }
 
+  const htmlInvoice = templateInvoice({
+    outletNama: so.outlet_nama,
+    tanggalDisplay: formatTanggalIndo(so.tanggal_pesanan),
+    items: itemsDenganHarga,
+    total,
+  });
+  const namaFileJpg = `INV-${so.outlet_nama.replace(/\s+/g, '')}-${so.tanggal_pesanan}-${salesOrderId}.jpg`;
+  const filePathJpg = path.join(FOLDER_OUTPUT, namaFileJpg);
+  await renderHtmlToJpg(htmlInvoice, filePathJpg);
+
   return {
     sukses: true,
     file_path: filePath,
+    file_path_jpg: filePathJpg,
     invoice_id: invoiceId,
     total,
     pesan: `Invoice untuk ${so.outlet_nama} berhasil dibuat, total Rp${total.toLocaleString('id-ID')}.`,
     barang_tanpa_harga: barangTanpaHarga,
-  };
+};
 }
 
 module.exports = { generateInvoice };

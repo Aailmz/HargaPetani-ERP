@@ -2,6 +2,8 @@ const ExcelJS = require('exceljs');
 const path = require('path');
 const fs = require('fs');
 const { db } = require('../db');
+const { renderHtmlToJpg } = require('./renderImage');
+const { templatePO } = require('./templates');
 
 const WARNA_HIJAU = 'FF92D050';
 const WARNA_ORANYE = 'FFF4B183';
@@ -149,9 +151,20 @@ async function generatePO({ supplierId, supplierNama, tanggal, items, labelKateg
     insertItem.run(poId, item.barang_id, item.outlet_id || null, item.qty, item.uom || null);
   }
 
+  const htmlPO = templatePO({
+    tanggalDisplay: formatTanggalIndo(tanggal),
+    labelKategori,
+    supplierNama,
+    grupBarang,
+  });
+  const namaFileJpg = `PO-${supplierNama.replace(/\s+/g, '')}-${tanggal}-${Date.now()}.jpg`;
+  const filePathJpg = path.join(FOLDER_OUTPUT, namaFileJpg);
+  await renderHtmlToJpg(htmlPO, filePathJpg);
+
   return {
     sukses: true,
     file_path: filePath,
+    file_path_jpg: filePathJpg,
     purchase_order_id: poId,
     pesan: `PO ke ${supplierNama} berhasil dibuat (${grupBarang.size} jenis barang, ${items.length} baris).`,
   };

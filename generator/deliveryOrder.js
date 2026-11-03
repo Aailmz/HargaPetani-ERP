@@ -2,6 +2,8 @@ const ExcelJS = require('exceljs');
 const path = require('path');
 const fs = require('fs');
 const { getSalesOrderDetail } = require('../salesOrder');
+const { renderHtmlToJpg } = require('./renderImage');
+const { templateDO } = require('./templates');
 
 const WARNA_HIJAU = 'FF92D050';
 const FOLDER_OUTPUT = path.join(__dirname, '..', 'output', 'delivery-order');
@@ -93,12 +95,26 @@ async function generateDO(salesOrderId) {
   const filePath = path.join(FOLDER_OUTPUT, namaFile);
   await workbook.xlsx.writeFile(filePath);
 
+  const htmlDO = templateDO({
+    outletNama: so.outlet_nama,
+    tanggalDisplay: formatTanggalIndo(so.tanggal_pesanan),
+    items: so.items,
+  });
+  const namaFileJpg = `DO-${so.outlet_nama.replace(/\s+/g, '')}-${so.tanggal_pesanan}-${salesOrderId}.jpg`;
+  const filePathJpg = path.join(FOLDER_OUTPUT, namaFileJpg);
+  await renderHtmlToJpg(htmlDO, filePathJpg);
+
   const db = require('../db').db;
   db.prepare(`
     INSERT INTO delivery_order (sales_order_id, status, file_path) VALUES (?, 'DIBUAT', ?)
   `).run(salesOrderId, filePath);
 
-  return { sukses: true, file_path: filePath, pesan: `Delivery Order untuk ${so.outlet_nama} berhasil dibuat.` };
+  return {
+    sukses: true,
+    file_path: filePath,
+    file_path_jpg: filePathJpg,
+    pesan: `Delivery Order untuk ${so.outlet_nama} berhasil dibuat.`,
+  };
 }
 
 module.exports = { generateDO, formatTanggalIndo };

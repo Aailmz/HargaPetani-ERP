@@ -1,39 +1,164 @@
+require('dotenv').config();
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, 'harga-petani-erp.db'));
+const db = new Database(path.join(__dirname, 'harga-petani-order.db'));
+db.pragma('journal_mode = WAL');
 
 // ========== SKEMA ==========
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS employees (
-    jid TEXT PRIMARY KEY,
-    nama TEXT,
-    posisi TEXT,
-    state TEXT DEFAULT 'IDLE',          -- IDLE | WAITING_NAMA | WAITING_POSISI
-    is_registered INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS operators (
-    jid TEXT PRIMARY KEY,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS reimburse (
+  CREATE TABLE IF NOT EXISTS klien (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_jid TEXT NOT NULL,
-    peruntukan TEXT NOT NULL,
-    nominal INTEGER NOT NULL,
-    status TEXT DEFAULT 'PENDING',
-    alasan_reject TEXT,
-    sheets_row INTEGER,
+    nama TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS outlet (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    klien_id INTEGER NOT NULL,
+    nama TEXT NOT NULL,
+    kode TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT
+    FOREIGN KEY (klien_id) REFERENCES klien(id),
+    UNIQUE(klien_id, nama)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS supplier (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nama TEXT NOT NULL UNIQUE,
+    kontak TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS barang (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nama TEXT NOT NULL UNIQUE,
+    satuan_default TEXT,
+    alias TEXT,                 -- JSON array string, cth: ["cabe ijo","cabe hijau"]
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS harga (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    klien_id INTEGER NOT NULL,
+    barang_id INTEGER NOT NULL,
+    harga INTEGER NOT NULL,
+    berlaku_sejak TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (klien_id) REFERENCES klien(id),
+    FOREIGN KEY (barang_id) REFERENCES barang(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sales_order (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outlet_id INTEGER NOT NULL,
+    tanggal_pesanan TEXT NOT NULL,
+    status TEXT DEFAULT 'BARU',   -- BARU | DIKIRIM | DITERIMA | INVOICED | LUNAS
+    teks_asli TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (outlet_id) REFERENCES outlet(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sales_order_item (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sales_order_id INTEGER NOT NULL,
+    barang_id INTEGER NOT NULL,
+    qty REAL NOT NULL,
+    uom TEXT,
+    FOREIGN KEY (sales_order_id) REFERENCES sales_order(id),
+    FOREIGN KEY (barang_id) REFERENCES barang(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS delivery_order (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sales_order_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'DIBUAT',  -- DIBUAT | DIAMBIL | DIKIRIM | DITERIMA
+    file_path TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sales_order_id) REFERENCES sales_order(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS purchase_order (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id INTEGER NOT NULL,
+    tanggal TEXT NOT NULL,
+    status TEXT DEFAULT 'DIBUAT',  -- DIBUAT | DITERIMA
+    file_path TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (supplier_id) REFERENCES supplier(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS purchase_order_item (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_order_id INTEGER NOT NULL,
+    barang_id INTEGER NOT NULL,
+    outlet_id INTEGER,            -- opsional, kalau mau catat ini buat outlet mana (format gambar 3)
+    qty REAL NOT NULL,
+    uom TEXT,
+    FOREIGN KEY (purchase_order_id) REFERENCES purchase_order(id),
+    FOREIGN KEY (barang_id) REFERENCES barang(id),
+    FOREIGN KEY (outlet_id) REFERENCES outlet(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tagihan_supplier (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id INTEGER NOT NULL,
+    purchase_order_id INTEGER,     -- nullable, di-link manual belakangan kalau ambigu
+    nominal INTEGER NOT NULL,
+    keterangan TEXT,
+    status TEXT DEFAULT 'BELUM_LUNAS',  -- BELUM_LUNAS | LUNAS
+    teks_asli TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT,
+    FOREIGN KEY (supplier_id) REFERENCES supplier(id),
+    FOREIGN KEY (purchase_order_id) REFERENCES purchase_order(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS invoice (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sales_order_id INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    status TEXT DEFAULT 'BELUM_LUNAS',  -- BELUM_LUNAS | LUNAS
+    file_path TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT,
+    FOREIGN KEY (sales_order_id) REFERENCES sales_order(id)
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS invoice_item (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL,
+    barang_id INTEGER NOT NULL,
+    qty REAL NOT NULL,
+    uom TEXT,
+    harga_satuan INTEGER NOT NULL,
+    subtotal INTEGER NOT NULL,
+    FOREIGN KEY (invoice_id) REFERENCES invoice(id),
+    FOREIGN KEY (barang_id) REFERENCES barang(id)
   )
 `);
 
@@ -41,251 +166,98 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     jid TEXT NOT NULL,
-    role TEXT NOT NULL,        -- 'user' | 'assistant'
+    role TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )
 `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS absensi_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_jid TEXT NOT NULL,
-    lat REAL,
-    long REAL,
-    created_at_display TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// ========== SEED AWAL ==========
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS kwitansi_pending (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_jid TEXT NOT NULL,
-    nama_file TEXT NOT NULL,
-    peruntukan TEXT,
-    nominal INTEGER,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-require('dotenv').config();
-
-// ========== SETUP OPERATOR ==========
-
-function setupOperator() {
-  const jidOperator = process.env.OPERATOR_JID;
-  if (!jidOperator) {
-    console.log('⚠️  OPERATOR_JID belum di-set di .env!');
-    return;
+function seedAwal() {
+  const klienSSB = db.prepare('SELECT id FROM klien WHERE nama = ?').get('SSB');
+  let klienId;
+  if (!klienSSB) {
+    klienId = db.prepare('INSERT INTO klien (nama) VALUES (?)').run('SSB').lastInsertRowid;
+    console.log('✅ Klien SSB dibuat');
+  } else {
+    klienId = klienSSB.id;
   }
-  const sudahAda = db.prepare('SELECT jid FROM operators WHERE jid = ?').get(jidOperator);
-  if (!sudahAda) {
-    db.prepare('INSERT INTO operators (jid) VALUES (?)').run(jidOperator);
-    console.log(`✅ Operator terdaftar: ${jidOperator}`);
+
+  const outletAwal = ['Kelapa Gading', 'Jombang', 'Sukatani', 'Kalijaya'];
+  for (const nama of outletAwal) {
+    const ada = db.prepare('SELECT id FROM outlet WHERE klien_id = ? AND nama = ?').get(klienId, nama);
+    if (!ada) {
+      db.prepare('INSERT INTO outlet (klien_id, nama) VALUES (?, ?)').run(klienId, nama);
+      console.log(`✅ Outlet ${nama} dibuat`);
+    }
   }
-}
-setupOperator();
 
-function isOperator(jid) {
-  const row = db.prepare('SELECT jid FROM operators WHERE jid = ?').get(jid);
-  return !!row;
-}
+  const hargaAwal = [
+    ['Toge', 'Kg', 12500],
+    ['Jeruk Wedang', 'Kg', 16900],
+    ['Jeruk Nipis', 'Kg', 28000],
+    ['Wortel Brastagi', 'Kg', 16500],
+    ['Seledri', 'Kg', 30000],
+    ['Jagung Kulit', 'Kg', 12000],
+    ['Daun Bawang', 'Kg', 20500],
+    ['Daun Jeruk', 'gr', 48000],
+    ['Daun Pisang', 'ikat', 12000],
+    ['Cabe Rawit Hijau', 'Kg', 48600],
+    ['Cabe Rawit Merah Burga', 'Kg', 71000],
+    ['Cabe Rawit Merah Burga Petik', 'Kg', 81500],
+    ['Jahe', 'Kg', 18750],
+    ['Sereh', 'Kg', 18500],
+    ['Lengkuas', 'Kg', 10000],
+  ];
 
-// ========== EMPLOYEES ==========
+  for (const [nama, satuan, harga] of hargaAwal) {
+    let barang = db.prepare('SELECT id FROM barang WHERE nama = ?').get(nama);
+    let barangId;
+    if (!barang) {
+      barangId = db.prepare('INSERT INTO barang (nama, satuan_default) VALUES (?, ?)').run(nama, satuan).lastInsertRowid;
+      console.log(`✅ Barang ${nama} dibuat`);
+    } else {
+      barangId = barang.id;
+    }
 
-function getOrCreateEmployee(jid) {
-  let employee = db.prepare('SELECT * FROM employees WHERE jid = ?').get(jid);
-  if (!employee) {
-    db.prepare('INSERT INTO employees (jid, state, is_registered) VALUES (?, ?, 0)').run(jid, 'IDLE');
-    employee = db.prepare('SELECT * FROM employees WHERE jid = ?').get(jid);
+    const adaHarga = db.prepare('SELECT id FROM harga WHERE klien_id = ? AND barang_id = ?').get(klienId, barangId);
+    if (!adaHarga) {
+      db.prepare('INSERT INTO harga (klien_id, barang_id, harga) VALUES (?, ?, ?)').run(klienId, barangId, harga);
+    }
   }
-  return employee;
+
+  console.log('✅ Seed selesai');
 }
 
-function getEmployee(jid) {
-  return getOrCreateEmployee(jid);
+seedAwal();
+
+// ========== HELPER QUERIES (dasar, akan ditambah di step berikutnya) ==========
+
+function getKlienByNama(nama) {
+  return db.prepare('SELECT * FROM klien WHERE nama = ?').get(nama);
 }
 
-function isEmployeeRegistered(jid) {
-  return getOrCreateEmployee(jid).is_registered === 1;
-}
-
-function registerEmployee(jid) {
-  getOrCreateEmployee(jid);
-  db.prepare('UPDATE employees SET is_registered = 1 WHERE jid = ?').run(jid);
-}
-
-function setEmployeeState(jid, state) {
-  getOrCreateEmployee(jid);
-  db.prepare('UPDATE employees SET state = ? WHERE jid = ?').run(state, jid);
-}
-
-function setEmployeeNama(jid, nama) {
-  getOrCreateEmployee(jid);
-  db.prepare('UPDATE employees SET nama = ? WHERE jid = ?').run(nama, jid);
-}
-
-function setEmployeePosisi(jid, posisi) {
-  getOrCreateEmployee(jid);
-  db.prepare('UPDATE employees SET posisi = ? WHERE jid = ?').run(posisi, jid);
-}
-
-function getAllEmployees() {
-  return db.prepare('SELECT * FROM employees WHERE is_registered = 1 ORDER BY created_at ASC').all();
-}
-
-// ========== ABSENSI ==========
-
-function catatAbsensiLog(employeeJid, lat, long, waktuDisplay) {
-  db.prepare(`
-    INSERT INTO absensi_log (employee_jid, lat, long, created_at_display) VALUES (?, ?, ?, ?)
-  `).run(employeeJid, lat, long, waktuDisplay);
-}
-
-function sudahCheckinHariIni(employeeJid) {
-  const row = db.prepare(`
-    SELECT COUNT(*) as c FROM absensi_log
-    WHERE employee_jid = ? AND date(created_at) = date('now', 'localtime')
-  `).get(employeeJid);
-  return row.c > 0;
-}
-
-function getAbsensiHariIni(employeeJid) {
-  return db.prepare(`
-    SELECT * FROM absensi_log
-    WHERE employee_jid = ? AND date(created_at) = date('now', 'localtime')
-    ORDER BY created_at ASC
-  `).all(employeeJid);
-}
-
-function getEmployeeBelumAbsenHariIni() {
-  return db.prepare(`
-    SELECT * FROM employees
-    WHERE is_registered = 1
-    AND jid NOT IN (
-      SELECT DISTINCT employee_jid FROM absensi_log
-      WHERE date(created_at) = date('now', 'localtime')
-    )
-  `).all();
-}
-
-// ========== REIMBURSE ==========
-
-function buatReimburseBaru(employeeJid, peruntukan, nominal) {
-  const result = db.prepare(`
-    INSERT INTO reimburse (employee_jid, peruntukan, nominal, status) VALUES (?, ?, ?, 'PENDING')
-  `).run(employeeJid, peruntukan, nominal);
-  return result.lastInsertRowid;
-}
-
-function buatKwitansiPending(employeeJid, namaFile) {
-  const result = db.prepare(`
-    INSERT INTO kwitansi_pending (employee_jid, nama_file) VALUES (?, ?)
-  `).run(employeeJid, namaFile);
-  return result.lastInsertRowid;
-}
-
-function getKwitansiPendingAktif(employeeJid) {
-  return db.prepare(`
-    SELECT * FROM kwitansi_pending WHERE employee_jid = ? ORDER BY created_at DESC LIMIT 1
-  `).get(employeeJid);
-}
-
-function lengkapiKwitansiPending(id, peruntukan, nominal) {
-  db.prepare(`
-    UPDATE kwitansi_pending SET peruntukan = ?, nominal = ? WHERE id = ?
-  `).run(peruntukan, nominal, id);
-}
-
-function hapusKwitansiPending(id) {
-  db.prepare('DELETE FROM kwitansi_pending WHERE id = ?').run(id);
-}
-
-function setSheetsRowReimburse(id, rowNumber) {
-  db.prepare('UPDATE reimburse SET sheets_row = ? WHERE id = ?').run(rowNumber, id);
-}
-
-function getReimburseById(id) {
-  return db.prepare('SELECT * FROM reimburse WHERE id = ?').get(id);
-}
-
-function getReimbursePendingTerbaru(limit = 5) {
-  return db.prepare(`
-    SELECT * FROM reimburse WHERE status = 'PENDING' ORDER BY created_at DESC LIMIT ?
-  `).all(limit);
-}
-
-function setStatusReimburse(id, status, alasanReject = null) {
-  const waktu = new Date().toISOString();
-  db.prepare(`
-    UPDATE reimburse SET status = ?, alasan_reject = ?, updated_at = ? WHERE id = ?
-  `).run(status, alasanReject, waktu, id);
-  return waktu;
-}
-
-// ========== CHAT HISTORY ==========
-
-const MAX_HISTORI_PER_JID = 20;
-
-function simpanChatHistory(jid, role, content) {
-  db.prepare(`
-    INSERT INTO chat_history (jid, role, content) VALUES (?, ?, ?)
-  `).run(jid, role, content);
-
-  const total = db.prepare('SELECT COUNT(*) as c FROM chat_history WHERE jid = ?').get(jid).c;
-  if (total > MAX_HISTORI_PER_JID) {
-    db.prepare(`
-      DELETE FROM chat_history WHERE id IN (
-        SELECT id FROM chat_history WHERE jid = ? ORDER BY created_at ASC LIMIT ?
-      )
-    `).run(jid, total - MAX_HISTORI_PER_JID);
+function getOrCreateOutlet(klienId, namaOutlet) {
+  let outlet = db.prepare('SELECT * FROM outlet WHERE klien_id = ? AND nama = ?').get(klienId, namaOutlet);
+  if (!outlet) {
+    const id = db.prepare('INSERT INTO outlet (klien_id, nama) VALUES (?, ?)').run(klienId, namaOutlet).lastInsertRowid;
+    outlet = db.prepare('SELECT * FROM outlet WHERE id = ?').get(id);
   }
+  return outlet;
 }
 
-function getChatHistory(jid, limit = MAX_HISTORI_PER_JID) {
-  const rows = db.prepare(`
-    SELECT role, content FROM chat_history WHERE jid = ? ORDER BY created_at ASC LIMIT ?
-  `).all(jid, limit);
-  return rows.map((r) => ({ role: r.role, content: r.content }));
+function getHargaTerbaru(klienId, barangId) {
+  return db.prepare(`
+    SELECT * FROM harga
+    WHERE klien_id = ? AND barang_id = ?
+    ORDER BY berlaku_sejak DESC LIMIT 1
+  `).get(klienId, barangId);
 }
 
 module.exports = {
   db,
-
-  // operator
-  isOperator,
-
-  // employees
-  getOrCreateEmployee,
-  getEmployee,
-  isEmployeeRegistered,
-  registerEmployee,
-  setEmployeeState,
-  setEmployeeNama,
-  setEmployeePosisi,
-  getAllEmployees,
-
-  // reimburse
-  buatReimburseBaru,
-  setSheetsRowReimburse,
-  getReimburseById,
-  getReimbursePendingTerbaru,
-  setStatusReimburse,
-
-  // chat history
-  simpanChatHistory,
-  getChatHistory,
-
-    // absensi
-  catatAbsensiLog,
-  sudahCheckinHariIni,
-  getAbsensiHariIni,
-  getEmployeeBelumAbsenHariIni,
-
-  // kwitansi pending
-  buatKwitansiPending,
-  getKwitansiPendingAktif,
-  lengkapiKwitansiPending,
-  hapusKwitansiPending,
+  getKlienByNama,
+  getOrCreateOutlet,
+  getHargaTerbaru,
 };

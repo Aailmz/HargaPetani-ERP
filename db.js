@@ -172,6 +172,20 @@ db.exec(`
   )
 `);
 
+// Staging buat preview-sebelum-commit (pesanan klien & tagihan supplier).
+// Satu staging aktif per (jid, tipe) - staging baru menimpa yang lama kalau belum dikonfirmasi.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_parse (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jid TEXT NOT NULL,
+    tipe TEXT NOT NULL,          -- 'pesanan' | 'tagihan'
+    data TEXT NOT NULL,          -- JSON
+    teks_asli TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(jid, tipe)
+  )
+`);
+
 // ========== SEED AWAL ==========
 
 function seedAwal() {
@@ -232,7 +246,7 @@ function seedAwal() {
 
 seedAwal();
 
-// ========== HELPER QUERIES (dasar, akan ditambah di step berikutnya) ==========
+// ========== HELPER QUERIES ==========
 
 function getKlienByNama(nama) {
   return db.prepare('SELECT * FROM klien WHERE nama = ?').get(nama);
@@ -255,9 +269,41 @@ function getHargaTerbaru(klienId, barangId) {
   `).get(klienId, barangId);
 }
 
+// ---------- Staging (pending_parse) helpers ----------
+
+function simpanStaging(jid, tipe, data, teksAsli) {
+  db.prepare(`
+    INSERT INTO pending_parse (jid, tipe, data, teks_asli)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(jid, tipe) DO UPDATE SET
+      data = excluded.data,
+      teks_asli = excluded.teks_asli,
+      created_at = CURRENT_TIMESTAMP
+  `).run(jid, tipe, JSON.stringify(data), teksAsli || null);
+}
+
+function getStaging(jid, tipe) {
+  const row = db.prepare('SELECT * FROM pending_parse WHERE jid = ? AND tipe = ?').get(jid, tipe);
+  if (!row) return null;
+  let data;
+  try {
+    data = JSON.parse(row.data);
+  } catch {
+    return null;
+  }
+  return { ...row, data };
+}
+
+function hapusStaging(jid, tipe) {
+  db.prepare('DELETE FROM pending_parse WHERE jid = ? AND tipe = ?').run(jid, tipe);
+}
+
 module.exports = {
   db,
   getKlienByNama,
   getOrCreateOutlet,
   getHargaTerbaru,
+  simpanStaging,
+  getStaging,
+  hapusStaging,
 };

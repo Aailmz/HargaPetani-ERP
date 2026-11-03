@@ -104,6 +104,16 @@ function normalisasiNamaBarang(namaMentah) {
   return null;
 }
 
+function cariBarangByNamaAtauId(ref) {
+  // ref bisa berupa angka (id) atau string (nama/alias)
+  if (ref === null || ref === undefined) return null;
+  if (typeof ref === 'number' || /^\d+$/.test(String(ref).trim())) {
+    const byId = db.prepare('SELECT * FROM barang WHERE id = ?').get(Number(ref));
+    if (byId) return byId;
+  }
+  return normalisasiNamaBarang(String(ref));
+}
+
 function buatBarangBaru(nama, satuan) {
   const id = db.prepare('INSERT INTO barang (nama, satuan_default) VALUES (?, ?)').run(nama, satuan).lastInsertRowid;
   return db.prepare('SELECT * FROM barang WHERE id = ?').get(id);
@@ -121,11 +131,65 @@ function tambahAlias(barangId, aliasBaru) {
   }
 }
 
+/**
+ * Gabungkan barang lama ke barang induk:
+ * - Migrate semua referensi (sales_order_item, invoice_item, purchase_order_item) ke barang induk.
+ * - Nama lama ditambahkan sebagai alias di barang induk.
+ * - Histori harga milik barang lama DIBUANG (sesuai keputusan: pakai harga induk).
+ * - Barang lama dihapus dari tabel barang setelah migrasi.
+ *
+ * Dibungkus dalam transaction supaya atomik.
+ */
+function gabungkanBarang(barangLamaId, barangIndukId) {
+  if (barangLamaId === barangIndukId) {
+    return { sukses: false, pesan: 'Barang lama dan barang induk tidak boleh sama.' };
+  }
+
+  const barangLama = db.prepare('SELECT * FROM barang WHERE id = ?').get(barangLamaId);
+  const barangInduk = db.prepare('SELECT * FROM barang WHERE id = ?').get(barangIndukId);
+
+  if (!barangLama) return { sukses: false, pesan: `Barang id ${barangLamaId} tidak ditemukan.` };
+  if (!barangInduk) return { sukses: false, pesan: `Barang id ${barangIndukId} tidak ditemukan.` };
+
+  const jalankan = db.transaction(() => {
+    db.prepare('UPDATE sales_order_item SET barang_id = ? WHERE barang_id = ?').run(barangIndukId, barangLamaId);
+    db.prepare('UPDATE invoice_item SET barang_id = ? WHERE barang_id = ?').run(barangIndukId, barangLamaId);
+    db.prepare('UPDATE purchase_order_item SET barang_id = ? WHERE barang_id = ?').run(barangIndukId, barangLamaId);
+
+    // Buang histori harga barang lama (keputusan: tidak dipertahankan)
+    db.prepare('DELETE FROM harga WHERE barang_id = ?').run(barangLamaId);
+
+    // Tambahkan nama lama + alias lama barang lama sebagai alias barang induk
+    tambahAlias(barangIndukId, barangLama.nama);
+    if (barangLama.alias) {
+      try {
+        const aliasLama = JSON.parse(barangLama.alias);
+        for (const a of aliasLama) tambahAlias(barangIndukId, a);
+      } catch {
+        // skip kalau corrupt
+      }
+    }
+
+    db.prepare('DELETE FROM barang WHERE id = ?').run(barangLamaId);
+  });
+
+  jalankan();
+
+  return {
+    sukses: true,
+    pesan: `"${barangLama.nama}" digabung jadi alias dari "${barangInduk.nama}". Semua referensi lama sudah dipindah.`,
+    barang_induk: barangInduk.nama,
+    barang_induk_id: barangIndukId,
+  };
+}
+
 module.exports = {
   callAiJson,
   parsePesananKlien,
   parseTagihanSupplier,
   normalisasiNamaBarang,
+  cariBarangByNamaAtauId,
   buatBarangBaru,
   tambahAlias,
+  gabungkanBarang,
 };

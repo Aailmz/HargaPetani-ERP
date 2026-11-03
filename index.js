@@ -140,7 +140,8 @@ function getChatHistory(jid) {
 async function handleIncomingMessage(jid, text) {
   const historiChat = getChatHistory(jid);
 
-  const hasil = await agent.jalankanAgent({ historiChat, pesanBaru: text });
+  // jid di-pass ke agent supaya staging preview (pending_parse) ter-scope per pengirim
+  const hasil = await agent.jalankanAgent({ historiChat, pesanBaru: text, jid });
 
   simpanChatHistory(jid, 'user', text);
 

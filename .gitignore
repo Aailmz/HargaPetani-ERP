@@ -4,4 +4,7 @@ credentials/
 images/temp/*
 !images/temp/.gitkeep
 *.db
+*.db-wal
+*.db-shm
+data/
 .env

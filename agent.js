@@ -1,511 +1,398 @@
+require('dotenv').config();
+const fs = require('fs');
 const OpenAI = require('openai');
-const {
-  db,
-  getKlienByNama,
-  simpanStaging,
-  getStaging,
-  hapusStaging,
-  getDaftarAllowedUser,
-  tambahAllowedUser,
-  hapusAllowedUser,
-} = require('./db');
-const {
-  parsePesananKlien,
-  parseTagihanSupplier,
-  normalisasiNamaBarang,
-  cariBarangByNamaAtauId,
-  buatBarangBaru,
-  gabungkanBarang,
-} = require('./parser');
-const {
-  simpanSalesOrder,
-  getSalesOrderDetail,
-  setStatusSalesOrder,
-  cariSalesOrderByOutletTanggal,
-  getSalesOrderHariIni,
-  getTotalKebutuhanBarang,
-  editItemSalesOrder,
-} = require('./salesOrder');
-const { generateDO } = require('./generator/deliveryOrder');
-const { generateInvoice } = require('./generator/invoice');
-const { generatePO, setKodeOutlet } = require('./generator/purchaseOrder');
+const { simpanPending, hapusPending, getPending } = require('./db');
+const dump = require('./dump');
+const { formatWaktu, potong } = require('./utils');
 
 const client = new OpenAI({
   apiKey: process.env.AI_API_KEY,
   baseURL: process.env.AI_BASE_URL,
+  timeout: 60 * 1000,
+  maxRetries: 1,
 });
 
 const MODEL = process.env.AI_MODEL;
-const MAX_TOOL_ITERATIONS = 6;
+const MAX_TOOL_ITERATIONS = 8;
+const MAX_TEKS_LAMPIRAN_DI_PROMPT = 4000;
+const TEKS_KUAT_MIN = 200; // teks sepanjang ini dianggap konten sungguhan, bukan sekadar jawaban singkat
 
 // ========== TOOLS ==========
 
 const TOOLS = [
-  // ---------- PREVIEW PESANAN (tahap 1: parse, belum simpan) ----------
   {
     type: 'function',
     function: {
-      name: 'preview_pesanan_masuk',
-      description: 'Parse teks pesanan barang dari klien (SSB/outlet) dan TAMPILKAN hasilnya ke owner untuk dikonfirmasi — BELUM disimpan ke database. Panggil ini (bukan langsung simpan) setiap kali owner forward teks yang keliatan seperti pesanan (ada Tanggal Pesanan/Outlet/daftar barang+qty). Setelah ini, owner bisa minta revisi (pakai edit_staging_pesanan) atau konfirmasi simpan (pakai konfirmasi_simpan_pesanan).',
+      name: 'simpan_data',
+      description:
+        'Simpan konten yang dikirim user sebagai satu entri dump. Panggil LANGSUNG kalau ada konten yang jelas (jangan minta konfirmasi dulu). Teks mentah, hasil baca gambar/PDF/Excel, dan file aslinya disimpan otomatis oleh sistem, jadi kamu cuma isi label dan hasil ekstraksi terstruktur.',
       parameters: {
         type: 'object',
         properties: {
-          teks_pesanan: { type: 'string', description: 'Teks mentah pesanan persis seperti yang diforward owner.' },
-        },
-        required: ['teks_pesanan'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'edit_staging_pesanan',
-      description: 'Revisi hasil preview pesanan yang belum disimpan (misal owner bilang "500gr-nya salah, harusnya 5kg", atau "outletnya Jombang bukan Sukatani", atau "hapus item daun jeruk", atau "tambah 2kg jahe"). Hanya berlaku kalau sudah ada preview_pesanan_masuk sebelumnya yang belum dikonfirmasi.',
-      parameters: {
-        type: 'object',
-        properties: {
-          outlet_baru: { type: 'string', description: 'Opsional, isi kalau owner mau koreksi nama outlet.' },
-          tanggal_baru: { type: 'string', description: 'Opsional, format YYYY-MM-DD, isi kalau owner mau koreksi tanggal.' },
-          item_diubah: {
-            type: 'array',
-            description: 'Opsional, daftar item yang mau diubah qty/uom-nya. Cocokkan berdasarkan nama_barang yang sudah ada di staging.',
-            items: {
-              type: 'object',
-              properties: {
-                nama_barang: { type: 'string', description: 'Nama barang persis seperti di staging saat ini (sebelum diubah).' },
-                qty_baru: { type: 'number' },
-                uom_baru: { type: 'string' },
-              },
-              required: ['nama_barang'],
-            },
+          jenis: { type: 'string', description: 'Label jenis data, singkat, huruf kecil, 1-4 kata (cth: "nota belanja", "stok opname", "komplain klien"). Utamakan jenis yang sudah ada di daftar.' },
+          judul: { type: 'string', description: 'Judul spesifik maksimal 80 karakter (siapa/apa/kapan).' },
+          ringkasan: { type: 'string', description: 'Ringkasan 1-2 kalimat isi data.' },
+          data: {
+            type: 'object',
+            description:
+              'Field penting hasil ekstraksi sebagai object fleksibel, kunci snake_case bahasa Indonesia. Contoh: {"tanggal":"2025-11-12","toko":"UD Makmur","total":450000,"item":[{"nama":"Cabe rawit","qty":5,"satuan":"kg","harga":48000}]}. Jangan mengarang field yang tidak ada di sumber.',
+            additionalProperties: true,
           },
-          item_dihapus: {
-            type: 'array',
-            description: 'Opsional, daftar nama_barang yang mau dihapus dari staging.',
-            items: { type: 'string' },
+          sumber: {
+            type: 'string',
+            enum: ['pesan_ini', 'tertunda'],
+            description: '"pesan_ini" (default) = konten di pesan sekarang. "tertunda" = konten dari pesan sebelumnya yang kamu tanyakan dulu karena ambigu dan sekarang sudah dijawab user.',
           },
-          item_ditambah: {
+          lampiran: {
             type: 'array',
-            description: 'Opsional, daftar item baru yang mau ditambahkan ke staging.',
-            items: {
-              type: 'object',
-              properties: {
-                nama_barang: { type: 'string' },
-                qty: { type: 'number' },
-                uom: { type: 'string' },
-              },
-              required: ['nama_barang', 'qty'],
-            },
+            items: { type: 'integer' },
+            description: 'Nomor lampiran (mulai 1) yang masuk ke entri ini. Kosongkan untuk memakai semua lampiran yang belum tersimpan. Pisahkan jadi beberapa panggilan kalau tiap lampiran adalah dokumen berbeda.',
           },
         },
-        required: [],
+        required: ['jenis', 'judul', 'ringkasan'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'konfirmasi_simpan_pesanan',
-      description: 'Commit hasil preview pesanan (yang sudah dikonfirmasi benar oleh owner) jadi Sales Order baru di database. Panggil ini SETELAH owner bilang oke/benar/lanjut atas hasil preview_pesanan_masuk (atau setelah direvisi lewat edit_staging_pesanan).',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'batalkan_staging_pesanan',
-      description: 'Batalkan/buang hasil preview pesanan yang belum dikonfirmasi, misal karena ternyata salah forward atau owner mau mulai ulang dari teks baru.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-
-  // ---------- PREVIEW TAGIHAN SUPPLIER (tahap 1: parse, belum simpan) ----------
-  {
-    type: 'function',
-    function: {
-      name: 'preview_tagihan_supplier',
-      description: 'Parse teks tagihan dari supplier dan TAMPILKAN hasilnya ke owner untuk dikonfirmasi — BELUM disimpan ke database. Panggil ini kalau owner forward pesan yang berisi tagihan/invoice dari supplier.',
+      name: 'ubah_data',
+      description: 'Ubah entri yang sudah tersimpan (misal user koreksi jenisnya, judulnya, atau ada field yang salah). Field di "data" digabung ke data lama; isi null untuk menghapus satu field.',
       parameters: {
         type: 'object',
         properties: {
-          teks_tagihan: { type: 'string', description: 'Teks mentah tagihan dari supplier.' },
-          nama_supplier: { type: 'string', description: 'Nama supplier kalau disebut owner terpisah dari teks tagihan.' },
+          id: { type: 'string', description: 'ID entri, cth "DUMP-0042" atau 42.' },
+          jenis: { type: 'string' },
+          judul: { type: 'string' },
+          ringkasan: { type: 'string' },
+          data: { type: 'object', additionalProperties: true },
         },
-        required: ['teks_tagihan'],
+        required: ['id'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'edit_staging_tagihan',
-      description: 'Revisi hasil preview tagihan yang belum disimpan (misal owner koreksi nominal, nama supplier, atau keterangan).',
+      name: 'hapus_data',
+      description: 'Hapus entri (hapus lunak, masih bisa dipulihkan admin). Pakai kalau user minta batal/hapus/salah kirim.',
       parameters: {
         type: 'object',
-        properties: {
-          supplier_baru: { type: 'string' },
-          nominal_baru: { type: 'integer' },
-          tanggal_baru: { type: 'string', description: 'Format YYYY-MM-DD' },
-          keterangan_baru: { type: 'string' },
-        },
-        required: [],
+        properties: { id: { type: 'string', description: 'ID entri, cth "DUMP-0042".' } },
+        required: ['id'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'konfirmasi_simpan_tagihan',
-      description: 'Commit hasil preview tagihan (yang sudah dikonfirmasi benar oleh owner) jadi catatan tagihan supplier di database. Panggil SETELAH owner konfirmasi oke.',
-      parameters: { type: 'object', properties: {}, required: [] },
+      name: 'batalkan_tertunda',
+      description: 'Buang konten yang tadi kamu tanyakan (belum disimpan) karena user bilang tidak jadi.',
+      parameters: { type: 'object', properties: {} },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'batalkan_staging_tagihan',
-      description: 'Batalkan/buang hasil preview tagihan yang belum dikonfirmasi.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-
-  // ---------- EDIT ITEM SO YANG SUDAH TERSIMPAN ----------
-  {
-    type: 'function',
-    function: {
-      name: 'edit_item_sales_order',
-      description: 'Edit qty, uom, dan/atau ganti barang pada SATU item di Sales Order yang SUDAH tersimpan di database (beda dengan edit_staging_pesanan yang buat preview belum tersimpan). Dipakai kalau owner baru sadar ada kesalahan setelah SO tersimpan (misal setelah lihat hasil DO/invoice). Diblokir kalau SO sudah berstatus INVOICED/LUNAS. Kalau owner tidak tahu item_id, cari dulu detail SO-nya (lewat cari_sales_order) buat dapat ID item.',
+      name: 'cari_data',
+      description: 'Cari entri yang sudah tersimpan berdasarkan kata kunci dan/atau jenis. Tanpa argumen = entri terbaru.',
       parameters: {
         type: 'object',
         properties: {
-          item_id: { type: 'integer', description: 'ID baris sales_order_item yang mau diedit.' },
-          qty_baru: { type: 'number' },
-          uom_baru: { type: 'string' },
-          nama_barang_baru: { type: 'string', description: 'Opsional, isi kalau item mau diganti ke barang lain (misal koreksi typo nama barang). Akan dicari/dibuat barangnya otomatis.' },
+          kata_kunci: { type: 'string' },
+          jenis: { type: 'string' },
+          limit: { type: 'integer', description: 'Default 10, maksimal 30.' },
         },
-        required: ['item_id'],
-      },
-    },
-  },
-
-  // ---------- MERGE ALIAS BARANG ----------
-  {
-    type: 'function',
-    function: {
-      name: 'gabung_alias_barang',
-      description: 'Gabungkan dua barang yang sebenarnya sama jadi satu (misal "Sledri" dan "Seledri", atau "Cabe ijo" dan "Cabe Rawit Hijau"). Barang yang digabung akan dihapus dan namanya jadi alias dari barang induk; semua pesanan/invoice/PO yang sudah ada otomatis dipindah ke barang induk. Histori harga barang yang digabung akan hilang, dipakai harga barang induk. HANYA panggil ini setelah owner eksplisit konfirmasi bahwa dua nama itu memang barang yang sama.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nama_atau_id_barang_lama: { type: 'string', description: 'Nama atau ID barang yang mau dihapus/digabung (jadi alias).' },
-          nama_atau_id_barang_induk: { type: 'string', description: 'Nama atau ID barang yang jadi induk/tetap dipakai.' },
-        },
-        required: ['nama_atau_id_barang_lama', 'nama_atau_id_barang_induk'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'pilih_varian_barang',
-      description: 'Dipakai saat ada nama barang ambigu (bisa merujuk ke beberapa varian, misal "cabe rawit merah" bisa berarti "Cabe Rawit Merah Burga" atau "Cabe Rawit Merah Burga Petik") dan owner sudah menjawab/memilih salah satunya. Ini akan menyimpan nama yang disebut owner sebagai alias permanen ke varian yang dipilih, supaya pertanyaan yang sama tidak terulang di masa depan.',
+      name: 'detail_data',
+      description: 'Ambil isi lengkap satu entri (termasuk teks asli) untuk ditampilkan ke user.',
       parameters: {
         type: 'object',
-        properties: {
-          nama_disebut_owner: { type: 'string', description: 'Nama/istilah ambigu yang tadi dipakai owner, misal "cabe rawit merah".' },
-          nama_atau_id_varian_dipilih: { type: 'string', description: 'Nama atau ID varian barang yang dipilih/dimaksud owner.' },
-        },
-        required: ['nama_disebut_owner', 'nama_atau_id_varian_dipilih'],
-      },
-    },
-  },
-
-  // ---------- GENERATE DOKUMEN ----------
-  {
-    type: 'function',
-    function: {
-      name: 'buat_delivery_order',
-      description: 'Generate file Excel Delivery Order dari sebuah Sales Order. Panggil kalau owner minta buatkan DO untuk outlet tertentu.',
-      parameters: {
-        type: 'object',
-        properties: {
-          sales_order_id: { type: 'integer', description: 'ID Sales Order. Kalau owner cuma sebut nama outlet+tanggal, cari dulu ID-nya pakai cari_sales_order.' },
-        },
-        required: ['sales_order_id'],
+        properties: { id: { type: 'string' } },
+        required: ['id'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'buat_invoice',
-      description: 'Generate file Excel Invoice dari sebuah Sales Order, dihitung pakai harga terbaru. Panggil kalau owner minta buatkan invoice untuk outlet tertentu.',
+      name: 'lihat_jenis',
+      description: 'Daftar jenis data yang sudah terkumpul beserta jumlahnya.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ekspor_data',
+      description: 'Buat file rekap data tersimpan (CSV atau JSON) dan kirim ke user. Pakai kalau user minta rekap/ekspor/download data.',
       parameters: {
         type: 'object',
         properties: {
-          sales_order_id: { type: 'integer' },
+          jenis: { type: 'string', description: 'Opsional, batasi ke satu jenis.' },
+          format: { type: 'string', enum: ['csv', 'json'], description: 'Default csv.' },
         },
-        required: ['sales_order_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'buat_purchase_order',
-      description: 'Generate file Excel Purchase Order ke supplier tertentu. SETIAP item WAJIB menyebutkan outlet asalnya. Kalau owner belum sebutkan outlet untuk suatu barang, TANYA dulu, jangan panggil tool ini.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nama_supplier: { type: 'string' },
-          tanggal: { type: 'string', description: 'Format YYYY-MM-DD, default hari ini kalau tidak disebut.' },
-          label_kategori: { type: 'string', description: 'Opsional, label kategori/brand di atas nama supplier kalau owner sebutkan.' },
-          items: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                nama_barang: { type: 'string' },
-                qty: { type: 'number' },
-                uom: { type: 'string' },
-                nama_outlet: { type: 'string', description: 'WAJIB diisi, outlet asal permintaan barang ini.' },
-              },
-              required: ['nama_barang', 'qty', 'nama_outlet'],
-            },
-          },
-        },
-        required: ['nama_supplier', 'items'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'set_kode_outlet',
-      description: 'Set kode singkatan manual untuk sebuah outlet (dipakai di dokumen PO). Panggil kalau owner kasih tau kode tertentu buat outlet, misal "kode outlet Sukatani itu ST".',
-      parameters: {
-        type: 'object',
-        properties: {
-          nama_outlet: { type: 'string' },
-          kode: { type: 'string' },
-        },
-        required: ['nama_outlet', 'kode'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_harga_barang',
-      description: 'Update harga jual sebuah barang ke klien (harga terbaru akan dipakai untuk invoice berikutnya). Histori harga lama tetap tersimpan.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nama_barang: { type: 'string' },
-          harga_baru: { type: 'integer' },
-        },
-        required: ['nama_barang', 'harga_baru'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_status_sales_order',
-      description: 'Update status sebuah Sales Order (misal owner bilang barang sudah diterima SSB).',
-      parameters: {
-        type: 'object',
-        properties: {
-          sales_order_id: { type: 'integer' },
-          status: { type: 'string', enum: ['BARU', 'DIKIRIM', 'DITERIMA', 'INVOICED', 'LUNAS'] },
-        },
-        required: ['sales_order_id', 'status'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_status_bayar_invoice',
-      description: 'Tandai sebuah invoice sudah lunas atau belum. Dipakai kalau owner bilang SSB sudah/belum bayar.',
-      parameters: {
-        type: 'object',
-        properties: {
-          invoice_id: { type: 'integer' },
-          status: { type: 'string', enum: ['BELUM_LUNAS', 'LUNAS'] },
-        },
-        required: ['invoice_id', 'status'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_status_bayar_tagihan',
-      description: 'Tandai sebuah tagihan supplier sudah lunas atau belum.',
-      parameters: {
-        type: 'object',
-        properties: {
-          tagihan_id: { type: 'integer' },
-          status: { type: 'string', enum: ['BELUM_LUNAS', 'LUNAS'] },
-        },
-        required: ['tagihan_id', 'status'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'link_tagihan_ke_po',
-      description: 'Kaitkan sebuah tagihan supplier ke purchase order tertentu. Dipakai kalau owner konfirmasi tagihan itu buat PO mana.',
-      parameters: {
-        type: 'object',
-        properties: {
-          tagihan_id: { type: 'integer' },
-          purchase_order_id: { type: 'integer' },
-        },
-        required: ['tagihan_id', 'purchase_order_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cari_sales_order',
-      description: 'Cari Sales Order berdasarkan nama outlet dan/atau tanggal. Dipakai buat resolve ID sebelum buat DO/invoice/edit item/update status kalau owner cuma sebut nama outlet. Hasilnya termasuk detail item + ID masing-masing item (berguna untuk edit_item_sales_order).',
-      parameters: {
-        type: 'object',
-        properties: {
-          nama_outlet: { type: 'string' },
-          tanggal: { type: 'string', description: 'Format YYYY-MM-DD' },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cek_kebutuhan_barang',
-      description: 'Lihat total kebutuhan tiap barang (gabungan semua outlet) di tanggal tertentu. Dipakai owner buat lihat dulu sebelum alokasi PO ke supplier.',
-      parameters: {
-        type: 'object',
-        properties: {
-          tanggal: { type: 'string', description: 'Format YYYY-MM-DD, default hari ini.' },
-        },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cek_piutang',
-      description: 'Lihat daftar invoice yang belum lunas (piutang ke SSB/klien).',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cek_utang',
-      description: 'Lihat daftar tagihan supplier yang belum lunas (utang ke supplier).',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-
-  // ---------- KELOLA NOMOR YANG BOLEH CHAT ----------
-  {
-    type: 'function',
-    function: {
-      name: 'lihat_daftar_nomor_izin',
-      description: 'Lihat daftar nomor WhatsApp yang diizinkan chat dengan bot ini.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'tambah_nomor_izin',
-      description: 'Tambah nomor WhatsApp baru supaya bisa chat dengan bot ini. HANYA bisa dipanggil oleh owner asli (nomor utama). Kalau yang minta bukan owner asli, tool ini akan otomatis ditolak.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nomor: { type: 'string', description: 'Nomor WhatsApp dalam format JID, misal "6281234567890@s.whatsapp.net". Kalau owner cuma kasih nomor telepon biasa, ubah ke format ini (angka negara+nomor tanpa + atau 0 di depan, lalu tambahkan "@s.whatsapp.net").' },
-          label: { type: 'string', description: 'Opsional, nama/label buat nomor ini biar gampang dikenali, misal "Budi - gudang".' },
-        },
-        required: ['nomor'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'hapus_nomor_izin',
-      description: 'Hapus nomor WhatsApp dari daftar yang diizinkan chat. HANYA bisa dipanggil oleh owner asli. Owner asli sendiri tidak bisa dihapus.',
-      parameters: {
-        type: 'object',
-        properties: {
-          nomor: { type: 'string', description: 'Nomor WhatsApp dalam format JID yang mau dihapus.' },
-        },
-        required: ['nomor'],
       },
     },
   },
 ];
 
-const SYSTEM_PROMPT = `Kamu asisten chat buat owner bisnis distributor sayur/bahan dapur "Harga Petani". Owner jual ke klien (SSB dkk) dan beli dari berbagai supplier secara dinamis.
+// ========== SYSTEM PROMPT ==========
 
-Gaya bicaramu:
-- Santai, efisien, seperti asisten kerja yang paham konteks, bukan formal kaku.
-- Jangan sebut dirimu "AI"/"bot"/"sistem".
-- Jawaban singkat, langsung ke poin.
+function buatSystemPrompt(ctx) {
+  const jenisAda = dump.daftarJenisGlobal(40);
+  const daftarJenis = jenisAda.length ? jenisAda.map((j) => `${j.jenis} (${j.jumlah})`).join(', ') : '(belum ada, kamu yang menentukan label pertama)';
+  const lokasi = ctx.chat.isGrup ? `grup "${ctx.chat.grupNama || '?'}"` : 'chat pribadi';
 
-ALUR PESANAN KLIEN (WAJIB 2 TAHAP, JANGAN LANGSUNG SIMPAN):
-- Kalau owner forward teks yang keliatannya pesanan outlet (ada Tanggal Pesanan/Outlet/daftar barang+qty), panggil preview_pesanan_masuk dulu. JANGAN simpan langsung.
-- Tampilkan hasil parse ke owner dengan jelas: outlet, tanggal, dan tiap item (nama barang + qty + uom). Kalau ada qty yang kelihatan ganjil/di luar kebiasaan (misal satuan gr padahal biasanya barang itu dipesan dalam kg, atau angka sangat besar/kecil dari biasanya), sebutkan supaya owner cek ulang - tapi tetap tampilkan apa adanya, jangan diam-diam diubah.
-- Kalau owner bilang ada yang salah, panggil edit_staging_pesanan sesuai koreksinya, lalu tampilkan ulang hasil yang sudah direvisi buat dikonfirmasi lagi.
-- Baru setelah owner bilang oke/benar/lanjut, panggil konfirmasi_simpan_pesanan buat commit ke database.
-- Kalau owner bilang batal/salah forward, panggil batalkan_staging_pesanan.
+  return `Kamu pencatat data untuk tim "Harga Petani" (bisnis distributor sayur dan bahan dapur). Kamu ada di grup WhatsApp dan chat pribadi. Orang mengirim apa saja ke kamu (teks, forward chat, nota, kwitansi, foto, PDF, Excel, voice note) dan tugasmu menyimpannya dengan rapi dan terstruktur, bukan teks mentah.
 
-ALUR TAGIHAN SUPPLIER (sama, 2 tahap):
-- Kalau owner forward teks tagihan dari supplier, panggil preview_tagihan_supplier dulu, tampilkan hasil parse (supplier, nominal, keterangan) buat dikonfirmasi.
-- Revisi lewat edit_staging_tagihan kalau ada koreksi, commit lewat konfirmasi_simpan_tagihan setelah owner oke.
+Tujuan besarnya: mengumpulkan contoh nyata alur kerja dan bentuk data yang dipakai tim, untuk dipelajari belakangan. Jadi yang terpenting adalah isi yang setia ke sumber, bukan interpretasi kreatif.
 
-EDIT DATA YANG SUDAH TERSIMPAN:
-- Kalau owner baru sadar ada kesalahan pada Sales Order yang SUDAH tersimpan (bukan staging/preview), pakai edit_item_sales_order. Cari dulu item_id-nya lewat cari_sales_order kalau belum tahu.
-- Barang yang sebenarnya sama tapi tercatat beda (typo, alias, cth "Sledri" vs "Seledri") digabungkan pakai gabung_alias_barang SETELAH owner eksplisit konfirmasi itu barang yang sama. Jangan panggil ini cuma berdasarkan dugaanmu sendiri.
-- Kalau nama barang ambigu (bisa beberapa varian, misal "cabe rawit merah" bisa Burga atau Burga Petik) dan kamu belum yakin, TANYA owner itu maksudnya varian yang mana. Begitu owner jawab, panggil pilih_varian_barang supaya nama itu otomatis ke-resolve ke varian yang benar di masa depan (tidak perlu nanya lagi).
+Konteks sekarang: ${formatWaktu()} (WIB), ${lokasi}, pengirim: ${ctx.pengirim.nama || 'tanpa nama'}${ctx.isOwner ? ' (owner)' : ''}.
 
-NOMOR YANG BOLEH CHAT:
-- Kalau owner minta tambah/hapus nomor yang boleh chat dengan bot, pakai tambah_nomor_izin / hapus_nomor_izin. Tool ini otomatis ditolak sistem kalau yang minta bukan owner asli (nomor utama) - kalau ditolak, sampaikan apa adanya ke pengirim, jangan coba akali.
-- Minta format nomor WhatsApp lengkap (atau nomor telepon biasa, nanti kamu konversi ke format JID) sebelum panggil tambah_nomor_izin.
+Jenis data yang sudah ada: ${daftarJenis}
 
-LAIN-LAIN:
-- Kalau owner minta generate dokumen (DO/Invoice/PO), dan dia cuma sebut nama outlet/tanggal tanpa ID pasti, panggil cari_sales_order dulu buat resolve ID-nya. Kalau hasil pencarian ada lebih dari 1 atau 0, tanya balik ke owner, jangan asal pilih.
-- PO ke supplier WAJIB per outlet (setiap barang harus jelas dari outlet mana). Kalau owner belum sebutkan breakdown per outlet, TANYA dulu sebelum panggil buat_purchase_order.
-- Barang yang invoice-nya kena harga 0 (belum ada harga di-set) akan diinfokan juga - selalu kasih tau owner, jangan diam-diam.
-- Setelah tool jalan, sampaikan hasil secara natural, bukan dump data mentah/JSON.
+ATURAN SIMPAN:
+- Kalau ada konten yang jelas, langsung panggil simpan_data. Jangan minta konfirmasi dulu.
+- Tanya HANYA kalau benar-benar ambigu: (a) tidak jelas ini data apa dan tebakan terbaikmu lemah, (b) pesan hampir kosong (misal cuma "tolong simpan" tanpa isi apa pun), (c) beberapa lampiran dan tidak jelas satu dokumen atau terpisah, (d) gambar/file gagal terbaca. Kalau tanya, cukup satu pertanyaan singkat dengan tebakan terbaikmu sebagai pilihan, contoh: "Ini nota belanja atau tagihan supplier?". Jangan simpan dulu. Begitu user menjawab, panggil simpan_data dengan sumber="tertunda".
+- Pesan yang jelas bukan dump (sapaan, pertanyaan ke kamu, minta cari/ubah/hapus/rekap) ditangani dengan tool lain atau jawaban singkat. Jangan menyimpan basa-basi.
+- Kalau user koreksi data yang baru kamu simpan ("bukan, ini tagihan supplier"), pakai ubah_data dengan ID dari riwayat chat. Kalau minta batal/hapus, pakai hapus_data.
 
-ATURAN PENULISAN:
-- Kapitalisasi normal, bukan Title Case tiap kata.
-- Jangan pakai tanda strip panjang (—) atau double dash (--).`;
+CARA MENGISI:
+- jenis: singkat, huruf kecil. Pakai jenis yang sudah ada kalau cocok, buat baru hanya kalau memang berbeda.
+- judul: spesifik, maksimal 80 karakter.
+- data: ekstrak field penting apa adanya: tanggal (format YYYY-MM-DD kalau pasti), pihak (toko, supplier, klien, outlet, orang), nominal (angka rupiah tanpa titik), item (array berisi nama, qty, satuan, harga), status, catatan. Field yang tidak ada di sumber jangan dibuat. Angka yang tidak terbaca jangan ditebak, tulis apa adanya atau tinggalkan.
+- Teks mentah dan file asli disimpan otomatis oleh sistem, jadi kamu tidak perlu menyalin isinya.
+- Beberapa lampiran: kalau tiap lampiran dokumen berbeda (misal 3 nota), panggil simpan_data sekali per lampiran dengan field lampiran. Kalau halaman dari satu dokumen, simpan sekali.
+- Voice note belum bisa ditranskrip. Simpan dengan jenis "voice note", judul memuat siapa pengirimnya, dan sebutkan konteks kalau ada teks pendampingnya.
+
+BALASAN:
+- simpan_data mengembalikan field "kartu". Kirim kartu itu APA ADANYA sebagai balasan. Boleh menambah satu kalimat pendek di bawahnya kalau ada hal penting (misal sebagian gambar tidak jelas terbaca). Jangan menulis ulang atau meringkas kartu.
+- Gaya santai dan singkat, bahasa Indonesia, kapitalisasi normal. Boleh format WhatsApp (*tebal*). Jangan pakai tanda strip panjang (—) atau double dash (--). Jangan menyebut dirimu AI, bot, atau sistem.
+
+AKSES:
+- Kamu hanya bisa melihat, mengubah, dan menghapus data dari chat ini${ctx.isOwner ? ', kecuali pengirim ini owner yang boleh mengakses semua data' : ''}. Kalau tool menolak, sampaikan apa adanya.`;
+}
+
+// ========== PESAN USER UNTUK MODEL ==========
+
+function renderKonten(konten, label) {
+  const bagian = [];
+  if (konten.teks) bagian.push(konten.teks);
+  if (konten.lampiran?.length) {
+    bagian.push('Lampiran:');
+    for (const lp of konten.lampiran) {
+      const nama = lp.namaAsli ? ` (${lp.namaAsli})` : '';
+      const status = lp.gagal ? ` [BERMASALAH: ${lp.gagal}]` : '';
+      const isi = lp.teksHasil ? `\n${potong(lp.teksHasil, MAX_TEKS_LAMPIRAN_DI_PROMPT)}` : '';
+      const caption = lp.caption ? `\nCaption: ${lp.caption}` : '';
+      bagian.push(`${lp.idx}. ${lp.tipe}${nama}${status}${caption}${isi}`);
+    }
+  }
+  return bagian.length ? `${label}\n${bagian.join('\n')}` : '';
+}
+
+function buatPesanUser(ctx) {
+  const header = `[Dari: ${ctx.pengirim.nama || 'tanpa nama'}${ctx.chat.isGrup ? ` · grup: ${ctx.chat.grupNama || '?'}` : ''}]`;
+  const utama = renderKonten(ctx.konten, 'Pesan ini:') || 'Pesan ini: (kosong)';
+  const tertunda = ctx.pending ? '\n\n' + renderKonten(ctx.pending, 'KONTEN TERTUNDA dari pesan sebelumnya (belum disimpan, kamu tadi bertanya soal ini; kalau pesan ini jawabannya, simpan dengan sumber="tertunda"):') : '';
+  // "ringkas" masuk riwayat chat (tanpa blok tertunda supaya riwayat tidak berisi duplikat)
+  return { lengkap: `${header}\n${utama}${tertunda}`, ringkas: `${header}\n${utama}` };
+}
+
+// ========== EKSEKUTOR TOOL ==========
+
+function pilihLampiran(sumberKonten, nomor) {
+  const semua = (sumberKonten.lampiran || []).filter((l) => !l.dipakai);
+  return Array.isArray(nomor) ? semua.filter((l) => nomor.includes(l.idx)) : semua;
+}
+
+async function eksekusiSimpanData({ jenis, judul, ringkasan, data, sumber, lampiran }, ctx) {
+  const pakaiTertunda = sumber === 'tertunda';
+  const sumberKonten = pakaiTertunda ? ctx.pending : ctx.konten;
+  if (!sumberKonten) return { error: 'Tidak ada konten tertunda. Minta user kirim ulang isinya.' };
+
+  const dipilih = pilihLampiran(sumberKonten, lampiran);
+  if (!sumberKonten.teks && dipilih.length === 0) {
+    return { error: 'Tidak ada isi yang bisa disimpan (pesan kosong dan tanpa lampiran). Tanyakan ke user apa yang mau disimpan.' };
+  }
+
+  const teksAsli = [
+    sumberKonten.teks || '',
+    ...dipilih.map((l) => `[Lampiran ${l.idx}: ${l.tipe}${l.namaAsli ? ` ${l.namaAsli}` : ''}${l.caption ? ` | caption: ${l.caption}` : ''}]\n${l.teksHasil || ''}`),
+  ].filter(Boolean).join('\n\n');
+
+  const entri = dump.simpanEntri({
+    jenis,
+    judul,
+    ringkasan,
+    data,
+    teksAsli,
+    chat: ctx.chat,
+    pengirim: ctx.pengirim,
+    lampiran: dipilih.filter((l) => l.path && fs.existsSync(l.path)).map((l) => ({ path: l.path, namaAsli: l.namaAsli, mimetype: l.mimetype, tipe: l.tipe, ukuran: l.ukuran })),
+  });
+
+  for (const l of dipilih) l.dipakai = true;
+  if (pakaiTertunda) ctx.pakaiTertunda = true;
+  ctx.entriBaru.push(entri.id);
+
+  return { sukses: true, id: dump.formatId(entri.id), kartu: dump.formatKartu(entri) };
+}
+
+function cekAkses(idInput, ctx) {
+  const id = dump.parseId(idInput);
+  if (!id) return { error: `ID "${idInput}" tidak valid.` };
+  const entri = dump.getEntri(id);
+  if (!entri || entri.status !== 'AKTIF') return { error: `${dump.formatId(id)} tidak ditemukan.` };
+  if (!dump.bolehAkses(entri, ctx.chat.jid, ctx.isOwner)) return { error: `${dump.formatId(id)} bukan data dari chat ini, tidak bisa diakses dari sini.` };
+  return { entri };
+}
+
+async function eksekusiUbahData({ id, jenis, judul, ringkasan, data }, ctx) {
+  const cek = cekAkses(id, ctx);
+  if (cek.error) return cek;
+  const baru = dump.ubahEntri(cek.entri.id, { jenis, judul, ringkasan, data });
+  ctx.entriDiubah.push(baru.id);
+  return { sukses: true, kartu: dump.formatKartu(baru, { judulKartu: 'Diperbarui' }) };
+}
+
+async function eksekusiHapusData({ id }, ctx) {
+  const cek = cekAkses(id, ctx);
+  if (cek.error) return cek;
+  dump.hapusEntri(cek.entri.id);
+  ctx.entriDiubah.push(cek.entri.id);
+  return { sukses: true, pesan: `🗑️ ${dump.formatId(cek.entri.id)} dihapus.` };
+}
+
+async function eksekusiBatalkanTertunda(_args, ctx) {
+  ctx.batalTertunda = true;
+  return { sukses: true };
+}
+
+async function eksekusiCariData({ kata_kunci, jenis, limit }, ctx) {
+  const hasil = dump.cariEntri({ kataKunci: kata_kunci, jenis, limit: limit || 10, chatJid: ctx.chat.jid, isOwner: ctx.isOwner });
+  return { jumlah: hasil.length, hasil: hasil.map((r) => ({ id: dump.formatId(r.id), baris: dump.barisRingkas(r), ringkasan: potong(r.ringkasan || '', 200) })) };
+}
+
+async function eksekusiDetailData({ id }, ctx) {
+  const cek = cekAkses(id, ctx);
+  if (cek.error) return cek;
+  return { kartu: dump.formatKartu(cek.entri, { judulKartu: 'Detail' }), teks_asli: potong(cek.entri.teks_asli || '', 3000) };
+}
+
+async function eksekusiLihatJenis(_args, ctx) {
+  return { jenis: dump.daftarJenis({ chatJid: ctx.chat.jid, isOwner: ctx.isOwner }) };
+}
+
+async function eksekusiEksporData({ jenis, format }, ctx) {
+  const hasil = dump.ekspor({ jenis, format: format || 'csv', chatJid: ctx.chat.jid, isOwner: ctx.isOwner });
+  if (!hasil) return { error: 'Belum ada data yang cocok untuk diekspor.' };
+  ctx.filesUntukDikirim.push(hasil.path);
+  return { sukses: true, jumlah_entri: hasil.jumlah, catatan: 'File akan dikirim otomatis setelah balasanmu.' };
+}
+
+const EKSEKUTOR = {
+  simpan_data: eksekusiSimpanData,
+  ubah_data: eksekusiUbahData,
+  hapus_data: eksekusiHapusData,
+  batalkan_tertunda: eksekusiBatalkanTertunda,
+  cari_data: eksekusiCariData,
+  detail_data: eksekusiDetailData,
+  lihat_jenis: eksekusiLihatJenis,
+  ekspor_data: eksekusiEksporData,
+};
+
+// ========== SISA KONTEN SETELAH GILIRAN SELESAI ==========
+
+function hapusFile(p) {
+  if (!p) return;
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {
+    /* abaikan */
+  }
+}
+
+/**
+ * Menentukan nasib konten tiap giliran:
+ * - kalau konten tertunda sudah dipakai/dibatalkan -> bersihkan
+ * - kalau pesan ini tidak disimpan dan kelihatan konten sungguhan -> jadi konten tertunda (nunggu jawaban user)
+ * - file sementara yang tidak dipakai siapa pun dihapus
+ */
+function selesaikanKonten(ctx) {
+  const sisaLampiran = ctx.konten.lampiran.filter((l) => l.path && !l.dipakai);
+  const lampiranPendingLama = ctx.pending?.lampiran || [];
+
+  if (ctx.pakaiTertunda || ctx.batalTertunda) {
+    for (const l of lampiranPendingLama) if (!l.dipakai) hapusFile(l.path);
+    hapusPending(ctx.chatKey);
+    ctx.pending = null;
+  }
+
+  const teks = (ctx.konten.teks || '').trim();
+  const kontenKuat = ctx.konten.kuat || teks.length >= TEKS_KUAT_MIN;
+  let jadiTertunda = false;
+  if (!ctx.batalTertunda) {
+    if (sisaLampiran.length) jadiTertunda = true;
+    else if (!ctx.adaTool && teks) jadiTertunda = kontenKuat || (!ctx.pending && teks.length >= 15);
+  }
+
+  if (jadiTertunda) {
+    // konten tertunda lama (kalau masih ada) tergantikan, file-nya dibuang
+    for (const l of ctx.pending?.lampiran || []) if (!l.dipakai) hapusFile(l.path);
+    simpanPending(ctx.chatKey, { teks: ctx.entriBaru.length ? '' : ctx.konten.teks, lampiran: sisaLampiran });
+    return;
+  }
+
+  for (const l of sisaLampiran) hapusFile(l.path);
+}
 
 // ========== LOOP AGENT ==========
 
-async function jalankanAgent({ historiChat, pesanBaru, jid, isOwnerAsliPengirim = false }) {
+/**
+ * @param {object} p
+ * @param {string} p.chatKey
+ * @param {{jid:string,isGrup:boolean,grupNama?:string}} p.chat
+ * @param {{jid:string,nama?:string}} p.pengirim
+ * @param {boolean} p.isOwner
+ * @param {{teks:string, lampiran:object[], kuat?:boolean}} p.konten
+ * @param {{role:string,content:string}[]} p.riwayat
+ */
+async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat }) {
+  const ctx = {
+    chatKey,
+    chat,
+    pengirim,
+    isOwner,
+    konten: { ...konten, lampiran: konten.lampiran.map((l, i) => ({ ...l, idx: i + 1 })) },
+    pending: getPending(chatKey),
+    adaTool: false,
+    pakaiTertunda: false,
+    batalTertunda: false,
+    entriBaru: [],
+    entriDiubah: [],
+    filesUntukDikirim: [],
+  };
+  if (ctx.pending) ctx.pending.lampiran = (ctx.pending.lampiran || []).map((l, i) => ({ ...l, idx: i + 1 }));
+
+  const pesanUser = buatPesanUser(ctx);
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    ...historiChat,
-    { role: 'user', content: pesanBaru },
+    { role: 'system', content: buatSystemPrompt(ctx) },
+    ...riwayat,
+    { role: 'user', content: pesanUser.lengkap },
   ];
 
-  let iterasi = 0;
-  let fileUntukDikirim = []; // kumpulkan file_path dari tool generate dokumen
+  const kartu = [];
+  let jawabanFinal = null;
+  let error = null;
 
-  while (iterasi < MAX_TOOL_ITERATIONS) {
-    iterasi++;
-
+  for (let iterasi = 0; iterasi < MAX_TOOL_ITERATIONS; iterasi++) {
     let completion;
     try {
       completion = await client.chat.completions.create({
@@ -513,536 +400,68 @@ async function jalankanAgent({ historiChat, pesanBaru, jid, isOwnerAsliPengirim 
         messages,
         tools: TOOLS,
         tool_choice: 'auto',
-        temperature: 0.3,
+        temperature: 0.2,
       });
     } catch (err) {
       console.error('❌ Agent API error:', err.message);
-      return { jawabanFinal: null, error: err.message, files: [] };
+      error = err.message;
+      break;
     }
 
     const pesanAi = completion.choices[0].message;
     messages.push(pesanAi);
 
-    if (!pesanAi.tool_calls || pesanAi.tool_calls.length === 0) {
-      return { jawabanFinal: pesanAi.content, error: null, files: fileUntukDikirim };
+    if (!pesanAi.tool_calls?.length) {
+      jawabanFinal = pesanAi.content;
+      break;
     }
 
     for (const toolCall of pesanAi.tool_calls) {
-      const namaFungsi = toolCall.function.name;
+      const nama = toolCall.function.name;
       let argumen;
       try {
-        argumen = JSON.parse(toolCall.function.arguments);
+        argumen = JSON.parse(toolCall.function.arguments || '{}');
       } catch {
         argumen = {};
       }
+      ctx.adaTool = true;
+      console.log(`🔧 Tool: ${nama}(${potong(JSON.stringify(argumen), 300)})`);
 
-      console.log(`🔧 Agent manggil tool: ${namaFungsi}(${JSON.stringify(argumen)})`);
-
-      let hasilTool;
+      let hasil;
       try {
-        const fungsiEksekutor = EKSEKUTOR[namaFungsi];
-        hasilTool = fungsiEksekutor ? await fungsiEksekutor(argumen, jid, isOwnerAsliPengirim) : { error: `Tool ${namaFungsi} tidak dikenali.` };
-
-        if (hasilTool && hasilTool.file_path) {
-            fileUntukDikirim.push(hasilTool.file_path);
-        }
-        if (hasilTool && hasilTool.file_path_jpg) {
-            fileUntukDikirim.push(hasilTool.file_path_jpg);
-        }
+        const fn = EKSEKUTOR[nama];
+        hasil = fn ? await fn(argumen, ctx) : { error: `Tool ${nama} tidak dikenali.` };
       } catch (err) {
-        console.error(`❌ Error eksekusi tool ${namaFungsi}:`, err.message);
-        hasilTool = { error: `Gagal eksekusi: ${err.message}` };
+        console.error(`❌ Error tool ${nama}:`, err.message);
+        hasil = { error: `Gagal eksekusi: ${err.message}` };
       }
+      if (hasil?.kartu && (nama === 'simpan_data' || nama === 'ubah_data')) kartu.push(hasil);
 
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(hasilTool),
-      });
+      messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(hasil) });
     }
   }
 
-  console.log('⚠️  Agent mencapai batas iterasi maksimal.');
-  return { jawabanFinal: 'Ada kendala teknis, boleh diulang?', error: 'MAX_ITERATIONS', files: fileUntukDikirim };
-}
+  if (!error && jawabanFinal === null) error = 'Agent melewati batas iterasi tool.';
 
-// ========== EKSEKUTOR TOOL: PREVIEW PESANAN ==========
-
-async function eksekusiPreviewPesananMasuk({ teks_pesanan }, jid) {
-  const parsed = await parsePesananKlien(teks_pesanan);
-  if (!parsed) return { sukses: false, pesan: 'Gagal parse teks pesanan, format mungkin tidak dikenali.' };
-  if (!parsed.items || parsed.items.length === 0) {
-    return { sukses: false, pesan: 'Tidak ada item barang yang terdeteksi dari teks ini.' };
+  // Model kadang lupa menyertakan kartu: pastikan pengirim selalu melihat ID yang tersimpan.
+  const semuaKartu = kartu.map((k) => k.kartu);
+  let balasan = (jawabanFinal || '').trim();
+  const idHilang = ctx.entriBaru.concat(ctx.entriDiubah).some((id) => !balasan.includes(dump.formatId(id)));
+  if (semuaKartu.length && (idHilang || !balasan)) {
+    balasan = semuaKartu.join('\n\n') + (balasan ? `\n\n${balasan}` : '');
   }
 
-  simpanStaging(jid, 'pesanan', parsed, teks_pesanan);
+  selesaikanKonten(ctx);
 
   return {
-    sukses: true,
-    belum_tersimpan: true,
-    preview: {
-      outlet: parsed.outlet,
-      tanggal_pesanan: parsed.tanggal_pesanan,
-      items: parsed.items.map((i) => ({ nama_barang: i.nama_barang, qty: i.qty, uom: i.uom })),
-    },
-    pesan: 'Ini masih preview, belum disimpan. Tampilkan ke owner dan minta konfirmasi sebelum panggil konfirmasi_simpan_pesanan.',
+    balasan: balasan || null,
+    error,
+    entriBaru: ctx.entriBaru,
+    entriDiubah: ctx.entriDiubah,
+    files: ctx.filesUntukDikirim,
+    // teks yang disimpan ke riwayat chat supaya percakapan lanjutan punya konteks
+    teksUser: pesanUser.ringkas,
   };
 }
-
-async function eksekusiEditStagingPesanan({ outlet_baru, tanggal_baru, item_diubah, item_dihapus, item_ditambah }, jid) {
-  const staging = getStaging(jid, 'pesanan');
-  if (!staging) return { sukses: false, pesan: 'Tidak ada preview pesanan yang aktif untuk direvisi. Minta owner kirim ulang teks pesanannya.' };
-
-  const data = staging.data;
-
-  if (outlet_baru) data.outlet = outlet_baru;
-  if (tanggal_baru) data.tanggal_pesanan = tanggal_baru;
-
-  if (Array.isArray(item_diubah)) {
-    for (const perubahan of item_diubah) {
-      const idx = data.items.findIndex((i) => i.nama_barang.toLowerCase().trim() === perubahan.nama_barang.toLowerCase().trim());
-      if (idx === -1) continue; // nama tidak ketemu, skip diam-diam, nanti kelihatan di preview ulang
-      if (perubahan.qty_baru !== undefined && perubahan.qty_baru !== null) data.items[idx].qty = perubahan.qty_baru;
-      if (perubahan.uom_baru) data.items[idx].uom = perubahan.uom_baru;
-    }
-  }
-
-  if (Array.isArray(item_dihapus)) {
-    const namaDihapusLower = item_dihapus.map((n) => n.toLowerCase().trim());
-    data.items = data.items.filter((i) => !namaDihapusLower.includes(i.nama_barang.toLowerCase().trim()));
-  }
-
-  if (Array.isArray(item_ditambah)) {
-    for (const baru of item_ditambah) {
-      data.items.push({ nama_barang: baru.nama_barang, qty: baru.qty, uom: baru.uom || null });
-    }
-  }
-
-  simpanStaging(jid, 'pesanan', data, staging.teks_asli);
-
-  return {
-    sukses: true,
-    belum_tersimpan: true,
-    preview: {
-      outlet: data.outlet,
-      tanggal_pesanan: data.tanggal_pesanan,
-      items: data.items.map((i) => ({ nama_barang: i.nama_barang, qty: i.qty, uom: i.uom })),
-    },
-    pesan: 'Staging sudah direvisi, masih belum tersimpan. Tampilkan ulang ke owner buat konfirmasi.',
-  };
-}
-
-async function eksekusiKonfirmasiSimpanPesanan(_args, jid) {
-  const staging = getStaging(jid, 'pesanan');
-  if (!staging) return { sukses: false, pesan: 'Tidak ada preview pesanan yang aktif untuk dikonfirmasi.' };
-
-  const hasil = simpanSalesOrder(staging.data, staging.teks_asli);
-  if (hasil.sukses) hapusStaging(jid, 'pesanan');
-  return hasil;
-}
-
-async function eksekusiBatalkanStagingPesanan(_args, jid) {
-  hapusStaging(jid, 'pesanan');
-  return { sukses: true, pesan: 'Preview pesanan dibatalkan.' };
-}
-
-// ========== EKSEKUTOR TOOL: PREVIEW TAGIHAN ==========
-
-async function eksekusiPreviewTagihanSupplier({ teks_tagihan, nama_supplier }, jid) {
-  const parsed = await parseTagihanSupplier(teks_tagihan);
-  if (!parsed || !parsed.nominal) {
-    return { sukses: false, pesan: 'Gagal extract nominal dari teks tagihan.' };
-  }
-
-  const data = {
-    supplier: nama_supplier || parsed.supplier,
-    nominal: parsed.nominal,
-    tanggal: parsed.tanggal || new Date().toISOString().split('T')[0],
-    keterangan: parsed.keterangan || null,
-  };
-
-  if (!data.supplier) {
-    // tetap simpan staging-nya, biar bisa dilengkapi lewat edit_staging_tagihan
-    simpanStaging(jid, 'tagihan', data, teks_tagihan);
-    return {
-      sukses: true,
-      belum_tersimpan: true,
-      preview: data,
-      pesan: 'Nama supplier tidak terdeteksi dari teks. Tanya owner nama suppliernya, lalu lengkapi lewat edit_staging_tagihan sebelum konfirmasi.',
-    };
-  }
-
-  simpanStaging(jid, 'tagihan', data, teks_tagihan);
-
-  return {
-    sukses: true,
-    belum_tersimpan: true,
-    preview: data,
-    pesan: 'Ini masih preview, belum disimpan. Tampilkan ke owner dan minta konfirmasi sebelum panggil konfirmasi_simpan_tagihan.',
-  };
-}
-
-async function eksekusiEditStagingTagihan({ supplier_baru, nominal_baru, tanggal_baru, keterangan_baru }, jid) {
-  const staging = getStaging(jid, 'tagihan');
-  if (!staging) return { sukses: false, pesan: 'Tidak ada preview tagihan yang aktif untuk direvisi.' };
-
-  const data = staging.data;
-  if (supplier_baru) data.supplier = supplier_baru;
-  if (nominal_baru !== undefined && nominal_baru !== null) data.nominal = nominal_baru;
-  if (tanggal_baru) data.tanggal = tanggal_baru;
-  if (keterangan_baru) data.keterangan = keterangan_baru;
-
-  simpanStaging(jid, 'tagihan', data, staging.teks_asli);
-
-  return {
-    sukses: true,
-    belum_tersimpan: true,
-    preview: data,
-    pesan: 'Staging tagihan sudah direvisi, masih belum tersimpan. Tampilkan ulang ke owner buat konfirmasi.',
-  };
-}
-
-async function eksekusiKonfirmasiSimpanTagihan(_args, jid) {
-  const staging = getStaging(jid, 'tagihan');
-  if (!staging) return { sukses: false, pesan: 'Tidak ada preview tagihan yang aktif untuk dikonfirmasi.' };
-
-  const data = staging.data;
-  if (!data.supplier) return { sukses: false, pesan: 'Nama supplier belum diisi, lengkapi dulu lewat edit_staging_tagihan.' };
-
-  let supplier = db.prepare('SELECT * FROM supplier WHERE nama = ?').get(data.supplier);
-  if (!supplier) {
-    const id = db.prepare('INSERT INTO supplier (nama) VALUES (?)').run(data.supplier).lastInsertRowid;
-    supplier = db.prepare('SELECT * FROM supplier WHERE id = ?').get(id);
-  }
-
-  const result = db.prepare(`
-    INSERT INTO tagihan_supplier (supplier_id, nominal, keterangan, status, teks_asli)
-    VALUES (?, ?, ?, 'BELUM_LUNAS', ?)
-  `).run(supplier.id, data.nominal, data.keterangan || null, staging.teks_asli);
-
-  hapusStaging(jid, 'tagihan');
-
-  return {
-    sukses: true,
-    tagihan_id: result.lastInsertRowid,
-    supplier: supplier.nama,
-    nominal: data.nominal,
-    pesan: `Tagihan dari ${supplier.nama} sebesar Rp${data.nominal.toLocaleString('id-ID')} tercatat. Mau dikaitkan ke PO mana?`,
-  };
-}
-
-async function eksekusiBatalkanStagingTagihan(_args, jid) {
-  hapusStaging(jid, 'tagihan');
-  return { sukses: true, pesan: 'Preview tagihan dibatalkan.' };
-}
-
-// ========== EKSEKUTOR TOOL: LAIN-LAIN ==========
-
-async function eksekusiLinkTagihanKePo({ tagihan_id, purchase_order_id }) {
-  const tagihan = db.prepare('SELECT * FROM tagihan_supplier WHERE id = ?').get(tagihan_id);
-  const po = db.prepare('SELECT * FROM purchase_order WHERE id = ?').get(purchase_order_id);
-  if (!tagihan) return { sukses: false, pesan: `Tagihan #${tagihan_id} tidak ditemukan.` };
-  if (!po) return { sukses: false, pesan: `PO #${purchase_order_id} tidak ditemukan.` };
-
-  db.prepare('UPDATE tagihan_supplier SET purchase_order_id = ? WHERE id = ?').run(purchase_order_id, tagihan_id);
-  return { sukses: true, pesan: `Tagihan #${tagihan_id} dikaitkan ke PO #${purchase_order_id}.` };
-}
-
-async function eksekusiBuatDeliveryOrder({ sales_order_id }) {
-  return generateDO(sales_order_id);
-}
-
-async function eksekusiBuatInvoice({ sales_order_id }) {
-  const hasil = await generateInvoice(sales_order_id);
-  if (hasil.sukses) setStatusSalesOrder(sales_order_id, 'INVOICED');
-  return hasil;
-}
-
-async function eksekusiBuatPurchaseOrder({ nama_supplier, tanggal, label_kategori, items }) {
-  let supplier = db.prepare('SELECT * FROM supplier WHERE nama = ?').get(nama_supplier);
-  if (!supplier) {
-    const id = db.prepare('INSERT INTO supplier (nama) VALUES (?)').run(nama_supplier).lastInsertRowid;
-    supplier = db.prepare('SELECT * FROM supplier WHERE id = ?').get(id);
-  }
-
-  const klien = getKlienByNama('SSB');
-  const itemsResolved = [];
-
-  for (const item of items) {
-    let barang = normalisasiNamaBarang(item.nama_barang);
-    if (!barang) barang = buatBarangBaru(item.nama_barang, item.uom || null);
-
-    const outlet = db.prepare(`
-      SELECT * FROM outlet WHERE klien_id = ? AND nama LIKE ?
-    `).get(klien.id, `%${item.nama_outlet}%`);
-
-    if (!outlet) {
-      return { sukses: false, pesan: `Outlet "${item.nama_outlet}" tidak ditemukan, sebutkan nama outlet yang benar.` };
-    }
-
-    itemsResolved.push({
-      nama_barang: barang.nama,
-      barang_id: barang.id,
-      qty: item.qty,
-      uom: item.uom || barang.satuan_default,
-      outlet_nama: outlet.nama,
-      outlet_id: outlet.id,
-    });
-  }
-
-  return generatePO({
-    supplierId: supplier.id,
-    supplierNama: supplier.nama,
-    tanggal: tanggal || new Date().toISOString().split('T')[0],
-    items: itemsResolved,
-    labelKategori: label_kategori,
-  });
-}
-
-async function eksekusiSetKodeOutlet({ nama_outlet, kode }) {
-  const klien = getKlienByNama('SSB');
-  const outlet = db.prepare('SELECT * FROM outlet WHERE klien_id = ? AND nama LIKE ?').get(klien.id, `%${nama_outlet}%`);
-  if (!outlet) return { sukses: false, pesan: `Outlet "${nama_outlet}" tidak ditemukan.` };
-
-  setKodeOutlet(outlet.id, kode);
-  return { sukses: true, pesan: `Kode outlet ${outlet.nama} di-set jadi "${kode.toUpperCase()}".` };
-}
-
-async function eksekusiUpdateHargaBarang({ nama_barang, harga_baru }) {
-  const barang = normalisasiNamaBarang(nama_barang);
-  if (!barang) return { sukses: false, pesan: `Barang "${nama_barang}" tidak ditemukan.` };
-
-  const klien = getKlienByNama('SSB');
-  db.prepare('INSERT INTO harga (klien_id, barang_id, harga) VALUES (?, ?, ?)').run(klien.id, barang.id, harga_baru);
-
-  return { sukses: true, pesan: `Harga ${barang.nama} di-update jadi Rp${harga_baru.toLocaleString('id-ID')}.` };
-}
-
-async function eksekusiUpdateStatusSalesOrder({ sales_order_id, status }) {
-  const so = getSalesOrderDetail(sales_order_id);
-  if (!so) return { sukses: false, pesan: `Sales Order #${sales_order_id} tidak ditemukan.` };
-
-  setStatusSalesOrder(sales_order_id, status);
-  return { sukses: true, pesan: `Status Sales Order ${so.outlet_nama} (#${sales_order_id}) jadi ${status}.` };
-}
-
-async function eksekusiUpdateStatusBayarInvoice({ invoice_id, status }) {
-  const invoice = db.prepare('SELECT * FROM invoice WHERE id = ?').get(invoice_id);
-  if (!invoice) return { sukses: false, pesan: `Invoice #${invoice_id} tidak ditemukan.` };
-
-  db.prepare('UPDATE invoice SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), invoice_id);
-  if (status === 'LUNAS') setStatusSalesOrder(invoice.sales_order_id, 'LUNAS');
-
-  return { sukses: true, pesan: `Invoice #${invoice_id} di-update jadi ${status}.` };
-}
-
-async function eksekusiUpdateStatusBayarTagihan({ tagihan_id, status }) {
-  const tagihan = db.prepare('SELECT * FROM tagihan_supplier WHERE id = ?').get(tagihan_id);
-  if (!tagihan) return { sukses: false, pesan: `Tagihan #${tagihan_id} tidak ditemukan.` };
-
-  db.prepare('UPDATE tagihan_supplier SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), tagihan_id);
-  return { sukses: true, pesan: `Tagihan #${tagihan_id} di-update jadi ${status}.` };
-}
-
-async function eksekusiCariSalesOrder({ nama_outlet, tanggal }) {
-  const tgl = tanggal || new Date().toISOString().split('T')[0];
-  let hasil;
-  if (nama_outlet) {
-    hasil = cariSalesOrderByOutletTanggal(nama_outlet, tgl);
-  } else {
-    hasil = getSalesOrderHariIni(tgl);
-  }
-
-  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada Sales Order yang cocok.' };
-
-  // Sertakan detail item (+ item id) biar agent bisa langsung resolve buat edit_item_sales_order
-  const daftar = hasil.map((so) => {
-    const detail = getSalesOrderDetail(so.id);
-    return {
-      id: so.id,
-      outlet: so.outlet_nama || detail?.outlet_nama,
-      tanggal: so.tanggal_pesanan,
-      status: so.status,
-      items: detail ? detail.items.map((i) => ({ item_id: i.id, barang: i.barang_nama, qty: i.qty, uom: i.uom })) : [],
-    };
-  });
-
-  return { sukses: true, jumlah: hasil.length, daftar };
-}
-
-async function eksekusiCekKebutuhanBarang({ tanggal }) {
-  const tgl = tanggal || new Date().toISOString().split('T')[0];
-  const hasil = getTotalKebutuhanBarang(tgl);
-
-  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: `Belum ada pesanan tanggal ${tgl}.` };
-
-  return {
-    sukses: true,
-    tanggal: tgl,
-    daftar: hasil.map((h) => ({ barang: h.barang_nama, total_qty: h.total_qty, uom: h.uom })),
-  };
-}
-
-async function eksekusiCekPiutang() {
-  const hasil = db.prepare(`
-    SELECT i.*, o.nama as outlet_nama
-    FROM invoice i
-    JOIN sales_order so ON so.id = i.sales_order_id
-    JOIN outlet o ON o.id = so.outlet_id
-    WHERE i.status = 'BELUM_LUNAS'
-    ORDER BY i.created_at ASC
-  `).all();
-
-  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada piutang, semua invoice sudah lunas.' };
-
-  const total = hasil.reduce((sum, i) => sum + i.total, 0);
-  return {
-    sukses: true,
-    jumlah: hasil.length,
-    total_piutang: total,
-    daftar: hasil.map((i) => ({ invoice_id: i.id, outlet: i.outlet_nama, total: i.total })),
-  };
-}
-
-async function eksekusiCekUtang() {
-  const hasil = db.prepare(`
-    SELECT ts.*, s.nama as supplier_nama
-    FROM tagihan_supplier ts
-    JOIN supplier s ON s.id = ts.supplier_id
-    WHERE ts.status = 'BELUM_LUNAS'
-    ORDER BY ts.created_at ASC
-  `).all();
-
-  if (hasil.length === 0) return { sukses: true, jumlah: 0, pesan: 'Tidak ada utang, semua tagihan sudah lunas.' };
-
-  const total = hasil.reduce((sum, t) => sum + t.nominal, 0);
-  return {
-    sukses: true,
-    jumlah: hasil.length,
-    total_utang: total,
-    daftar: hasil.map((t) => ({ tagihan_id: t.id, supplier: t.supplier_nama, nominal: t.nominal })),
-  };
-}
-
-// ---------- Edit item SO tersimpan ----------
-
-async function eksekusiEditItemSalesOrder({ item_id, qty_baru, uom_baru, nama_barang_baru }) {
-  let barangIdBaru;
-
-  if (nama_barang_baru) {
-    let barang = normalisasiNamaBarang(nama_barang_baru);
-    if (!barang) barang = buatBarangBaru(nama_barang_baru, uom_baru || null);
-    barangIdBaru = barang.id;
-  }
-
-  return editItemSalesOrder(item_id, {
-    qty: qty_baru,
-    uom: uom_baru,
-    barang_id_baru: barangIdBaru,
-  });
-}
-
-// ---------- Merge alias / pilih varian ----------
-
-async function eksekusiGabungAliasBarang({ nama_atau_id_barang_lama, nama_atau_id_barang_induk }) {
-  const barangLama = cariBarangByNamaAtauId(nama_atau_id_barang_lama);
-  const barangInduk = cariBarangByNamaAtauId(nama_atau_id_barang_induk);
-
-  if (!barangLama) return { sukses: false, pesan: `Barang "${nama_atau_id_barang_lama}" tidak ditemukan.` };
-  if (!barangInduk) return { sukses: false, pesan: `Barang "${nama_atau_id_barang_induk}" tidak ditemukan.` };
-
-  return gabungkanBarang(barangLama.id, barangInduk.id);
-}
-
-async function eksekusiPilihVarianBarang({ nama_disebut_owner, nama_atau_id_varian_dipilih }) {
-  const varian = cariBarangByNamaAtauId(nama_atau_id_varian_dipilih);
-  if (!varian) return { sukses: false, pesan: `Varian "${nama_atau_id_varian_dipilih}" tidak ditemukan.` };
-
-  // Kalau "nama_disebut_owner" kebetulan sudah jadi nama barang lain yang berdiri sendiri
-  // (bukan cuma istilah ambigu lepas), gabungkan beneran lewat gabungkanBarang supaya
-  // referensi lama (kalau ada) ikut pindah. Kalau belum ada entity barang itu sama sekali,
-  // cukup tambah sebagai alias baru.
-  const existing = normalisasiNamaBarang(nama_disebut_owner);
-  if (existing && existing.id !== varian.id) {
-    return gabungkanBarang(existing.id, varian.id);
-  }
-
-  const { tambahAlias } = require('./parser');
-  tambahAlias(varian.id, nama_disebut_owner);
-
-  return {
-    sukses: true,
-    pesan: `Oke, "${nama_disebut_owner}" sekarang otomatis merujuk ke "${varian.nama}". Tidak akan ditanya lagi ke depannya.`,
-    barang: varian.nama,
-    barang_id: varian.id,
-  };
-}
-
-// ---------- Kelola nomor yang boleh chat ----------
-
-async function eksekusiLihatDaftarNomorIzin() {
-  const daftar = getDaftarAllowedUser();
-  return {
-    sukses: true,
-    daftar: daftar.map((u) => ({ nomor: u.jid, label: u.label, owner_asli: !!u.is_owner_asli })),
-  };
-}
-
-async function eksekusiTambahNomorIzin({ nomor, label }, _jid, isOwnerAsliPengirim) {
-  if (!isOwnerAsliPengirim) {
-    return { sukses: false, pesan: 'Cuma owner asli (nomor utama) yang bisa menambah nomor baru.' };
-  }
-  const hasil = tambahAllowedUser(nomor, label);
-  if (!hasil.sukses) return hasil;
-  return { sukses: true, pesan: `Nomor ${nomor} ditambahkan${label ? ` (${label})` : ''}, sekarang bisa chat dengan bot ini.` };
-}
-
-async function eksekusiHapusNomorIzin({ nomor }, _jid, isOwnerAsliPengirim) {
-  if (!isOwnerAsliPengirim) {
-    return { sukses: false, pesan: 'Cuma owner asli (nomor utama) yang bisa menghapus nomor.' };
-  }
-  const hasil = hapusAllowedUser(nomor);
-  if (!hasil.sukses) return hasil;
-  return { sukses: true, pesan: `Nomor ${nomor} dihapus dari daftar yang diizinkan.` };
-}
-
-const EKSEKUTOR = {
-  // preview pesanan
-  preview_pesanan_masuk: eksekusiPreviewPesananMasuk,
-  edit_staging_pesanan: eksekusiEditStagingPesanan,
-  konfirmasi_simpan_pesanan: eksekusiKonfirmasiSimpanPesanan,
-  batalkan_staging_pesanan: eksekusiBatalkanStagingPesanan,
-
-  // preview tagihan
-  preview_tagihan_supplier: eksekusiPreviewTagihanSupplier,
-  edit_staging_tagihan: eksekusiEditStagingTagihan,
-  konfirmasi_simpan_tagihan: eksekusiKonfirmasiSimpanTagihan,
-  batalkan_staging_tagihan: eksekusiBatalkanStagingTagihan,
-
-  // edit item tersimpan & merge alias
-  edit_item_sales_order: eksekusiEditItemSalesOrder,
-  gabung_alias_barang: eksekusiGabungAliasBarang,
-  pilih_varian_barang: eksekusiPilihVarianBarang,
-
-  // dokumen & lain-lain
-  link_tagihan_ke_po: eksekusiLinkTagihanKePo,
-  buat_delivery_order: eksekusiBuatDeliveryOrder,
-  buat_invoice: eksekusiBuatInvoice,
-  buat_purchase_order: eksekusiBuatPurchaseOrder,
-  set_kode_outlet: eksekusiSetKodeOutlet,
-  update_harga_barang: eksekusiUpdateHargaBarang,
-  update_status_sales_order: eksekusiUpdateStatusSalesOrder,
-  update_status_bayar_invoice: eksekusiUpdateStatusBayarInvoice,
-  update_status_bayar_tagihan: eksekusiUpdateStatusBayarTagihan,
-  cari_sales_order: eksekusiCariSalesOrder,
-  cek_kebutuhan_barang: eksekusiCekKebutuhanBarang,
-  cek_piutang: eksekusiCekPiutang,
-  cek_utang: eksekusiCekUtang,
-
-  // kelola nomor yang boleh chat
-  lihat_daftar_nomor_izin: eksekusiLihatDaftarNomorIzin,
-  tambah_nomor_izin: eksekusiTambahNomorIzin,
-  hapus_nomor_izin: eksekusiHapusNomorIzin,
-};
 
 module.exports = { jalankanAgent };

@@ -17,6 +17,7 @@
     "googleapis": "^189.0.0",
     "node-cron": "^4.6.0",
     "openai": "^7.47.0",
+    "pdf-parse": "^2.4.5",
     "puppeteer": "^25.16.0",
     "qrcode-terminal": "^0.12.0"
   }

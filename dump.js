@@ -127,7 +127,7 @@ function cariEntriByPesan(chatJid, pesanIds) {
  * Lanjutkan entri yang sudah ada: teks baru ditambahkan ke teks_asli, file baru ditambahkan
  * sebagai DUMP-<id>-<n>.<ext>, dan field (judul/ringkasan/data) bisa diperbarui sekaligus.
  */
-function tambahKeEntri(id, { teksTambahan, lampiran = [], judul, ringkasan, data }) {
+function tambahKeEntri(id, { teksTambahan, lampiran = [], judul, ringkasan, data, perluKonfirmasi }) {
   const proses = db.transaction(() => {
     const e = getEntri(id);
     if (!e) return null;
@@ -155,7 +155,7 @@ function tambahKeEntri(id, { teksTambahan, lampiran = [], judul, ringkasan, data
 
   const fileBaruIds = proses();
   if (fileBaruIds === null) return null;
-  ubahEntri(id, { judul, ringkasan, data }); // sekaligus memperbarui updated_at
+  ubahEntri(id, { judul, ringkasan, data, perluKonfirmasi }); // sekaligus memperbarui updated_at
   db.prepare('UPDATE entri SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
   return { entri: getEntri(id), fileBaruIds };
 }
@@ -227,7 +227,26 @@ function daftarJenisGlobal(limit = 40) {
 
 // ========== UBAH / HAPUS ==========
 
-function ubahEntri(id, { jenis, judul, ringkasan, data }) {
+const KUNCI_KONFIRMASI = 'perlu_konfirmasi';
+
+/** Daftar hal yang masih perlu dikonfirmasi pada sebuah data (array string, bisa kosong). */
+function daftarKonfirmasi(data) {
+  const v = data && data[KUNCI_KONFIRMASI];
+  return Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : [];
+}
+
+/** Status yang ditampilkan di Sheets. */
+function statusEntri(e) {
+  if (e.status !== 'AKTIF') return 'Dihapus';
+  return daftarKonfirmasi(e.data).length ? 'Perlu konfirmasi' : 'Aktif';
+}
+
+/**
+ * Ubah entri. `data` digabung ke data lama (null = hapus field). `perluKonfirmasi` menggantikan daftar
+ * hal yang masih diragukan ([] = semua sudah terjawab). `catatanKoreksi` dicatat di teks_asli sebagai
+ * log koreksi, jadi teks asli aslinya tidak pernah ditimpa.
+ */
+function ubahEntri(id, { jenis, judul, ringkasan, data, perluKonfirmasi, catatanKoreksi, oleh }) {
   const e = getEntri(id);
   if (!e) return null;
 
@@ -237,14 +256,30 @@ function ubahEntri(id, { jenis, judul, ringkasan, data }) {
   if (jenis) { sets.push('jenis = ?'); params.push(normalisasiJenis(jenis)); }
   if (judul) { sets.push('judul = ?'); params.push(potong(judul, 200)); }
   if (ringkasan) { sets.push('ringkasan = ?'); params.push(potong(ringkasan, 2000)); }
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
+
+  const adaData = data && typeof data === 'object' && !Array.isArray(data);
+  const adaKonfirmasi = Array.isArray(perluKonfirmasi);
+  if (adaData || adaKonfirmasi) {
     const gabung = { ...(e.data || {}) };
-    for (const [k, v] of Object.entries(data)) {
-      if (v === null) delete gabung[k];
-      else gabung[k] = v;
+    if (adaData) {
+      for (const [k, v] of Object.entries(data)) {
+        if (v === null) delete gabung[k];
+        else gabung[k] = v;
+      }
+    }
+    if (adaKonfirmasi) {
+      const sisa = perluKonfirmasi.map((x) => String(x).trim()).filter(Boolean);
+      if (sisa.length) gabung[KUNCI_KONFIRMASI] = sisa;
+      else delete gabung[KUNCI_KONFIRMASI];
     }
     sets.push('data_json = ?');
     params.push(rapikanData(gabung));
+  }
+
+  if (catatanKoreksi) {
+    const log = `--- Koreksi ${formatWaktu()}${oleh ? ` oleh ${oleh}` : ''} ---\n${catatanKoreksi}`;
+    sets.push('teks_asli = ?');
+    params.push(potong([e.teks_asli || '', log].join('\n\n').trim(), MAX_TEKS_ASLI));
   }
 
   if (sets.length) {
@@ -297,8 +332,9 @@ function formatKartu(entri, { judulKartu = 'Tersimpan' } = {}) {
   if (entri.judul) baris.push(`*${entri.judul}*`);
   if (entri.ringkasan) baris.push(entri.ringkasan);
 
+  const konfirmasi = daftarKonfirmasi(entri.data);
   if (entri.data && typeof entri.data === 'object') {
-    const kolom = Object.entries(entri.data).slice(0, 12);
+    const kolom = Object.entries(entri.data).filter(([k]) => k !== KUNCI_KONFIRMASI).slice(0, 12);
     if (kolom.length) baris.push('');
     for (const [k, v] of kolom) {
       if (Array.isArray(v) && v.length && typeof v[0] === 'object' && v[0] !== null) {
@@ -309,7 +345,13 @@ function formatKartu(entri, { judulKartu = 'Tersimpan' } = {}) {
         baris.push(`• ${labelKunci(k)}: ${potong(formatNilai(v), 200)}`);
       }
     }
-    if (Object.keys(entri.data).length > 12) baris.push('• …');
+    if (Object.keys(entri.data).filter((k) => k !== KUNCI_KONFIRMASI).length > 12) baris.push('• …');
+  }
+
+  if (konfirmasi.length) {
+    baris.push('', '❓ *Perlu dikonfirmasi:*');
+    konfirmasi.forEach((x, i) => baris.push(`${i + 1}. ${x}`));
+    baris.push('_Balas pesan ini untuk menjawab atau mengoreksi._');
   }
 
   if (entri.files?.length) baris.push('', `📎 ${entri.files.map((f) => f.nama).join(', ')}`);
@@ -345,8 +387,14 @@ function barisItemObjek(o) {
 function detailSheet(data) {
   if (!data || typeof data !== 'object') return '';
   const baris = [];
+  const konfirmasi = daftarKonfirmasi(data);
+  if (konfirmasi.length) {
+    baris.push('⚠ PERLU KONFIRMASI:');
+    for (const x of konfirmasi) baris.push(`  ? ${x}`);
+    baris.push('');
+  }
   for (const [k, v] of Object.entries(data)) {
-    if (v === null || v === undefined || v === '') continue;
+    if (k === KUNCI_KONFIRMASI || v === null || v === undefined || v === '') continue;
     if (Array.isArray(v) && v.length && typeof v[0] === 'object' && v[0] !== null) {
       baris.push(`${labelKunci(k)}:`);
       for (const x of v) baris.push(`  • ${barisItemObjek(x)}`);
@@ -444,6 +492,8 @@ module.exports = {
   ubahEntri,
   hapusEntri,
   setSheetRow,
+  statusEntri,
+  daftarKonfirmasi,
   catatPesan,
   pesanDiEntri,
   cariEntriByPesan,

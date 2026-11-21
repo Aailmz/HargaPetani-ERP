@@ -43,6 +43,12 @@ const TOOLS = [
             enum: ['pesan_ini', 'tertunda'],
             description: '"pesan_ini" (default) = konten di pesan sekarang. "tertunda" = konten dari pesan sebelumnya yang kamu tanyakan dulu karena ambigu dan sekarang sudah dijawab user.',
           },
+          perlu_konfirmasi: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Hal yang janggal atau bisa ditafsir lebih dari satu cara di sumber (angka tidak cocok, satuan harga tidak jelas, tanggal ganda, dll), ditulis sebagai pertanyaan spesifik. Kosongkan kalau tidak ada. Jangan memilih satu tafsiran diam-diam: isi data sesuai teks apa adanya dan taruh keraguannya di sini.',
+          },
           lampiran: {
             type: 'array',
             items: { type: 'integer' },
@@ -67,6 +73,7 @@ const TOOLS = [
           ringkasan: { type: 'string', description: 'Ringkasan baru yang mencakup perkembangan terbaru.' },
           data: { type: 'object', additionalProperties: true, description: 'Field baru atau yang berubah (null untuk menghapus field).' },
           sumber: { type: 'string', enum: ['pesan_ini', 'tertunda'] },
+          perlu_konfirmasi: { type: 'array', items: { type: 'string' }, description: 'Daftar hal yang masih belum terjawab sekarang ([] kalau semua beres).' },
         },
         required: ['id'],
       },
@@ -85,6 +92,15 @@ const TOOLS = [
           judul: { type: 'string' },
           ringkasan: { type: 'string' },
           data: { type: 'object', additionalProperties: true },
+          perlu_konfirmasi: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Daftar hal yang MASIH belum terjawab setelah koreksi ini. Kirim [] kalau semuanya sudah terjawab; hilangkan poin yang sudah dijawab user.',
+          },
+          catatan_koreksi: {
+            type: 'string',
+            description: 'Kutipan kata-kata user yang mengoreksi atau menjawab (apa adanya). Dicatat terpisah, teks asli tidak ditimpa.',
+          },
         },
         required: ['id'],
       },
@@ -182,6 +198,12 @@ ATURAN SIMPAN:
 - Pesan yang jelas bukan dump (sapaan, pertanyaan ke kamu, minta cari/ubah/hapus/rekap) ditangani dengan tool lain atau jawaban singkat. Jangan menyimpan basa-basi.
 - Kalau user koreksi data yang baru kamu simpan ("bukan, ini tagihan supplier"), pakai ubah_data dengan ID dari riwayat chat. Kalau minta batal/hapus, pakai hapus_data.
 
+HAL YANG MERAGUKAN DAN KOREKSI:
+- Kalau saat menyimpan kamu menemukan hal yang janggal atau bisa ditafsir lebih dari satu cara (angka tidak cocok, misal total tidak sama dengan qty x harga; satuan harga tidak jelas, per pack atau per pcs; tanggal ganda; nama pihak mirip), JANGAN memilih satu tafsiran diam-diam dan jangan menaruh dugaanmu sebagai fakta di data. Simpan data apa adanya sesuai sumber, lalu tulis keraguannya sebagai pertanyaan spesifik di perlu_konfirmasi. Contoh: "Total Rp400.000 tidak sama dengan 10 x 8.000 = 80.000. Apakah harga 8.000 per pcs, dan berapa pcs isi 1 pack?". Kartu otomatis menampilkannya dan mengajak user membalas pesan itu.
+- Kalau ada blok "PESAN INI MEMBALAS PESAN KAMU SEBELUMNYA TENTANG", user sedang menjawab atau mengoreksi dump itu. Panggil ubah_data untuk dump tersebut: terapkan koreksi persis seperti kata user (misal ubah struktur item, tambah field yang baru diketahui), isi catatan_koreksi dengan kutipan kata user, dan kirim perlu_konfirmasi berisi hanya poin yang MASIH belum terjawab ([] kalau semuanya beres). Teks asli tidak berubah, koreksi dicatat terpisah. Kalau jawabannya belum menuntaskan keraguan atau masih bisa dibaca dua cara, tanyakan lagi, jangan dianggap beres.
+- Koreksi dari orang lain, bukan pengirim awal, tetap diterima dan dicatat siapa yang mengoreksi. Kalau user mengoreksi tanpa menyebut dump mana dan ada lebih dari satu kemungkinan, tanya dulu dump yang mana.
+- Jangan hanya menyebut keraguan di balasan: selalu masukkan juga ke perlu_konfirmasi supaya tersimpan dan terlihat di Sheets sampai terjawab.
+
 GAMBAR DAN FILE (JANGAN SOK TAHU):
 - Isi data hanya dari apa yang tertulis atau terlihat. Jangan menebak angka, nama, atau tanggal yang tidak terbaca, jangan menghitung atau melengkapi sendiri (misal menjumlah total yang tidak tertulis), dan jangan mengarang jenis dokumen. Bagian yang tidak jelas biarkan kosong di data dan catat di field "tidak_terbaca" (daftar teks) supaya terlihat jelas bahwa itu memang tidak terbaca.
 - Hasil baca gambar memuat baris KEJELASAN. Kalau gambar jelas dan kamu yakin isinya, langsung simpan. TANYA dulu (jangan simpan) kalau salah satunya benar: KEJELASAN bukan "jelas" dan bagian pentingnya (total, tanggal, nama pihak, atau angka utama) meragukan; tulisan tangan yang bisa dibaca lebih dari satu cara; tidak jelas gambar itu dokumen apa; atau gambar tanpa teks dan tanpa pesan pendamping sehingga tidak jelas mau dicatat sebagai apa.
@@ -232,11 +254,16 @@ function buatPesanUser(ctx) {
   const header = `[Dari: ${ctx.pengirim.nama || 'tanpa nama'}${ctx.chat.isGrup ? ` · grup: ${ctx.chat.grupNama || '?'}` : ''}]`;
   const utama = renderKonten(ctx.konten, 'Pesan ini:') || 'Pesan ini: (kosong)';
   const tertunda = ctx.pending ? '\n\n' + renderKonten(ctx.pending, 'KONTEN TERTUNDA dari pesan sebelumnya (belum disimpan, kamu tadi bertanya soal ini; kalau pesan ini jawabannya, simpan dengan sumber="tertunda"):') : '';
+  const rujukan = ctx.rujukan.length
+    ? `\n\nPESAN INI MEMBALAS PESAN KAMU SEBELUMNYA TENTANG:\n${ctx.rujukan
+        .map((e) => `${dump.formatId(e.id)} (${e.jenis}: ${e.judul || 'tanpa judul'})\nData saat ini: ${potong(JSON.stringify(e.data || {}), 3000)}`)
+        .join('\n')}\nAnggap pesan ini jawaban atau koreksi untuk data tersebut.`
+    : '';
   const sudah = ctx.sudahAda.length
     ? `\n\nSUDAH TERSIMPAN: sebagian pesan di atas sudah tercatat sebagai ${ctx.sudahAda.map((e) => `${dump.formatId(e.id)} (${e.jenis}: ${e.judul || 'tanpa judul'})`).join('; ')}.`
     : '';
   // "ringkas" masuk riwayat chat (tanpa blok tertunda supaya riwayat tidak berisi duplikat)
-  return { lengkap: `${header}\n${utama}${sudah}${tertunda}`, ringkas: `${header}\n${utama}` };
+  return { lengkap: `${header}\n${utama}${sudah}${rujukan}${tertunda}`, ringkas: `${header}\n${utama}` };
 }
 
 // ========== EKSEKUTOR TOOL ==========
@@ -246,7 +273,7 @@ function pilihLampiran(sumberKonten, nomor) {
   return Array.isArray(nomor) ? semua.filter((l) => nomor.includes(l.idx)) : semua;
 }
 
-async function eksekusiSimpanData({ jenis, judul, ringkasan, data, sumber, lampiran }, ctx) {
+async function eksekusiSimpanData({ jenis, judul, ringkasan, data, sumber, lampiran, perlu_konfirmasi }, ctx) {
   const pakaiTertunda = sumber === 'tertunda';
   const sumberKonten = pakaiTertunda ? ctx.pending : ctx.konten;
   if (!sumberKonten) return { error: 'Tidak ada konten tertunda. Minta user kirim ulang isinya.' };
@@ -261,11 +288,15 @@ async function eksekusiSimpanData({ jenis, judul, ringkasan, data, sumber, lampi
     ...dipilih.map((l) => `[Lampiran ${l.idx}: ${l.tipe}${l.namaAsli ? ` ${l.namaAsli}` : ''}${l.caption ? ` | caption: ${l.caption}` : ''}]\n${l.teksHasil || ''}`),
   ].filter(Boolean).join('\n\n');
 
+  const dataFinal = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
+  const konfirmasi = Array.isArray(perlu_konfirmasi) ? perlu_konfirmasi.map((x) => String(x).trim()).filter(Boolean) : [];
+  if (konfirmasi.length) dataFinal.perlu_konfirmasi = konfirmasi;
+
   const entri = dump.simpanEntri({
     jenis,
     judul,
     ringkasan,
-    data,
+    data: Object.keys(dataFinal).length ? dataFinal : null,
     teksAsli,
     chat: ctx.chat,
     pengirim: ctx.pengirim,
@@ -289,7 +320,7 @@ function blokLampiran(l) {
   return `[Lampiran ${l.idx}: ${l.tipe}${l.namaAsli ? ` ${l.namaAsli}` : ''}]\n${l.teksHasil || ''}`;
 }
 
-async function eksekusiLanjutkanData({ id, judul, ringkasan, data, sumber }, ctx) {
+async function eksekusiLanjutkanData({ id, judul, ringkasan, data, sumber, perlu_konfirmasi }, ctx) {
   const cek = cekAkses(id, ctx);
   if (cek.error) return cek;
   const sumberKonten = sumber === 'tertunda' ? ctx.pending : ctx.konten;
@@ -323,6 +354,7 @@ async function eksekusiLanjutkanData({ id, judul, ringkasan, data, sumber }, ctx
     judul,
     ringkasan,
     data,
+    perluKonfirmasi: perlu_konfirmasi,
     lampiran: lampiranBaru.filter((l) => l.path && fs.existsSync(l.path)).map((l) => ({ path: l.path, namaAsli: l.namaAsli, mimetype: l.mimetype, tipe: l.tipe, ukuran: l.ukuran })),
   });
   dump.catatPesan(cek.entri.id, ctx.chat.jid, [...bagianBaru.map((b) => b.id), ...lampiranBaru.map((l) => l.pesanId)]);
@@ -342,10 +374,20 @@ function cekAkses(idInput, ctx) {
   return { entri };
 }
 
-async function eksekusiUbahData({ id, jenis, judul, ringkasan, data }, ctx) {
+async function eksekusiUbahData({ id, jenis, judul, ringkasan, data, perlu_konfirmasi, catatan_koreksi }, ctx) {
   const cek = cekAkses(id, ctx);
   if (cek.error) return cek;
-  const baru = dump.ubahEntri(cek.entri.id, { jenis, judul, ringkasan, data });
+  const baru = dump.ubahEntri(cek.entri.id, {
+    jenis,
+    judul,
+    ringkasan,
+    data,
+    perluKonfirmasi: perlu_konfirmasi,
+    catatanKoreksi: catatan_koreksi,
+    oleh: ctx.pengirim.nama,
+  });
+  // pesan koreksi ikut tercatat di dump ini, jadi balasan berikutnya di thread yang sama nyambung
+  dump.catatPesan(baru.id, ctx.chat.jid, ctx.konten.pesanIds);
   ctx.entriDiubah.push(baru.id);
   return { sukses: true, kartu: dump.formatKartu(baru, { judulKartu: 'Diperbarui' }) };
 }
@@ -468,6 +510,7 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
     konten: { ...konten, lampiran: konten.lampiran.map((l, i) => ({ ...l, idx: i + 1 })) },
     pending: getPending(chatKey),
     sudahAda: dump.cariEntriByPesan(chat.jid, konten.pesanIds),
+    rujukan: (konten.rujukanIds || []).map((rid) => dump.getEntri(rid)).filter((e) => e && e.status === 'AKTIF'),
     adaTool: false,
     pakaiTertunda: false,
     batalTertunda: false,

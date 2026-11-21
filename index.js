@@ -353,6 +353,9 @@ async function prosesPesan({ m, content, chatJid, isGrup, senderJid, pengirimNam
   const pengirim = { jid: senderJid, nama: pengirimNama };
   const konten = await kumpulkanKonten({ m, content, chatJid, isGrup, senderJid, pengirimNama, ci, balasBot });
 
+  // Membalas pesan bot: cari dump mana yang dibahas pesan bot itu, supaya jawaban/koreksi tepat sasaran
+  if (balasBot && ci?.stanzaId) konten.rujukanIds = dump.cariEntriByPesan(chat.jid, [ci.stanzaId]).map((e) => e.id);
+
   const lampiranBermasalah = konten.lampiran.filter((l) => l.gagal && /terlalu besar/.test(l.gagal));
   if (lampiranBermasalah.length) {
     await kirimTeks(replyJid, `Ada file yang terlalu besar (batas ${media.MAX_BYTES / 1048576} MB), jadi tidak ikut disimpan.`, quotedMsg);
@@ -397,7 +400,13 @@ async function prosesPesan({ m, content, chatJid, isGrup, senderJid, pengirimNam
     simpanChatHistory(chat.jid, 'assistant', balasan);
   }
 
-  if (balasan) await kirimTeks(replyJid, balasan, quotedMsg);
+  const terkirim = balasan ? await kirimTeks(replyJid, balasan, quotedMsg) : null;
+
+  // Ingat pesan bot ini membahas dump yang mana: kalau seseorang membalasnya (jawaban/koreksi), targetnya jelas
+  const idPesanBot = terkirim?.key?.id;
+  if (idPesanBot) {
+    for (const id of new Set([...entriBaru, ...entriDiubah, ...(konten.rujukanIds || [])])) dump.catatPesan(id, chat.jid, [idPesanBot]);
+  }
 
   for (const f of files) {
     try {

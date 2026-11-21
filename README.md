@@ -15,6 +15,8 @@ Versi ERP sebelumnya (SO, DO, invoice, PO) ada di git history, commit `a56cf4f`.
 - **Chat pribadi**: siapa saja boleh. Setiap pesan dianggap dump.
 - Bot langsung menyimpan dan membalas kartu ringkas (`DUMP-0042`, jenis, judul, field). Bot bertanya hanya kalau benar-benar ambigu, lalu simpan setelah dijawab.
 - Koreksi: "bukan, ini tagihan supplier", "hapus DUMP-0042", "ubah total jadi 500rb".
+- **Hal yang meragukan** (misal total tidak sama dengan qty x harga, satuan harga tidak jelas): bot tetap menyimpan datanya apa adanya, tapi menaruh pertanyaannya di daftar *Perlu dikonfirmasi*. Kartu menampilkannya dengan ajakan "Balas pesan ini", dan di Sheets statusnya jadi `Perlu konfirmasi` (bisa difilter).
+- **Menjawab/mengoreksi:** *balas (reply) kartu bot itu*, siapa pun orangnya, tanpa perlu tag. Bot tahu kartu itu milik dump yang mana, menerapkan koreksinya, dan menghapus poin yang sudah terjawab. Teks asli tidak pernah ditimpa: koreksi dicatat terpisah di teks asli (`--- Koreksi <waktu> oleh <nama> ---`). Alternatif: tag bot dan sebut ID-nya, misal `@bot DUMP-0007: 10 pack = 50 pcs, 1 pcs 8000`. Pesan biasa tanpa reply dan tanpa tag tidak dibaca bot.
 - `@bot rekap` / `@bot rekap nota belanja json`: kirim file CSV/JSON. `@bot ada jenis apa aja`, `@bot cari cabe`.
 
 ## Penyimpanan

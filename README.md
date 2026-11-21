@@ -28,7 +28,7 @@ Semua ada di folder `data/` (di-gitignore, backup folder ini saja):
 | `data/exports/` | Hasil rekap |
 | `data/tmp/` | File sementara (otomatis dibersihkan) |
 
-Isi DB berupa teks. Gambar dibaca model vision (deskripsi + OCR), PDF diambil teksnya, Excel diubah jadi tabel teks. Voice note diterima dan disimpan, transkripsi belum ada.
+Isi DB berupa teks. Gambar dibaca langsung oleh Claude (deskripsi + OCR), PDF diambil teksnya, Excel diubah jadi tabel teks. Voice note diterima dan disimpan, transkripsi belum ada.
 
 File yang mengandung gambar/dokumen/voice diteruskan ke WhatsApp owner (`OWNER_JID`) dengan caption `DUMP-0042 · jenis · judul · dari ...`. Cari `DUMP-0042` di chat untuk menemukannya.
 
@@ -47,10 +47,9 @@ Tampilan ini diterapkan otomatis tiap bot start. Kalau susunan kolom di tab berb
 ## Konfigurasi `.env`
 
 ```
-AI_API_KEY=...
-AI_BASE_URL=...
-AI_MODEL=...            # harus mendukung tool calling
-AI_VISION_MODEL=...     # opsional, default AI_MODEL; harus mendukung gambar
+ANTHROPIC_API_KEY=sk-ant-...      # kunci API Claude
+CLAUDE_MODEL=claude-haiku-5-5     # opsional, default claude-haiku-5-5
+CLAUDE_EFFORT=medium              # opsional: low | medium | high | xhigh | max (kosong = bawaan model)
 OWNER_JID=62812xxxx@s.whatsapp.net
 GOOGLE_SERVICE_ACCOUNT_PATH=credentials/xxx.json   # opsional
 GOOGLE_SPREADSHEET_ID=...                          # opsional

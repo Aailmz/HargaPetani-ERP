@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { db, DIR_FILES, DIR_EXPORT } = require('./db');
-const { formatWaktuDb, potong } = require('./utils');
+const { formatWaktu, formatWaktuDb, potong } = require('./utils');
 
 const MAX_DATA_JSON = 30000;
 const MAX_TEKS_ASLI = 200000;
@@ -97,6 +97,67 @@ function simpanEntri({ jenis, judul, ringkasan, data, teksAsli, chat, pengirim, 
   });
 
   return getEntri(proses());
+}
+
+// ========== PESAN WHATSAPP <-> ENTRI ==========
+
+function catatPesan(entriId, chatJid, pesanIds) {
+  const ins = db.prepare('INSERT OR IGNORE INTO entri_pesan (entri_id, chat_jid, pesan_id) VALUES (?, ?, ?)');
+  for (const p of new Set((pesanIds || []).filter(Boolean))) ins.run(entriId, chatJid, String(p));
+}
+
+function pesanDiEntri(entriId) {
+  return new Set(db.prepare('SELECT pesan_id FROM entri_pesan WHERE entri_id = ?').all(entriId).map((r) => r.pesan_id));
+}
+
+/** Entri aktif di chat ini yang sudah memuat salah satu pesan WhatsApp tersebut. */
+function cariEntriByPesan(chatJid, pesanIds) {
+  const ids = [...new Set((pesanIds || []).filter(Boolean).map(String))];
+  if (!ids.length) return [];
+  const tanda = ids.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT DISTINCT e.id, e.jenis, e.judul FROM entri e
+    JOIN entri_pesan p ON p.entri_id = e.id
+    WHERE p.chat_jid = ? AND p.pesan_id IN (${tanda}) AND e.status = 'AKTIF'
+    ORDER BY e.id
+  `).all(chatJid, ...ids);
+}
+
+/**
+ * Lanjutkan entri yang sudah ada: teks baru ditambahkan ke teks_asli, file baru ditambahkan
+ * sebagai DUMP-<id>-<n>.<ext>, dan field (judul/ringkasan/data) bisa diperbarui sekaligus.
+ */
+function tambahKeEntri(id, { teksTambahan, lampiran = [], judul, ringkasan, data }) {
+  const proses = db.transaction(() => {
+    const e = getEntri(id);
+    if (!e) return null;
+
+    if (teksTambahan) {
+      const gabung = [e.teks_asli || '', `--- Lanjutan ${formatWaktu()} ---`, teksTambahan].join('\n\n').trim();
+      db.prepare('UPDATE entri SET teks_asli = ? WHERE id = ?').run(potong(gabung, MAX_TEKS_ASLI), id);
+    }
+
+    let urutan = e.files.reduce((mx, f) => Math.max(mx, f.urutan || 0), 0);
+    const fileBaruIds = [];
+    for (const lp of lampiran) {
+      urutan += 1;
+      const nama = `${formatId(id)}${urutan > 1 ? `-${urutan}` : ''}${ekstensiDari(lp.namaAsli, lp.mimetype)}`;
+      const tujuan = path.join(DIR_FILES, nama);
+      fs.renameSync(lp.path, tujuan);
+      const fid = db.prepare(`
+        INSERT INTO entri_file (entri_id, nama, nama_asli, path, mimetype, tipe, ukuran, urutan)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, nama, lp.namaAsli || null, tujuan, lp.mimetype || null, lp.tipe || 'file', lp.ukuran || null, urutan).lastInsertRowid;
+      fileBaruIds.push(Number(fid));
+    }
+    return fileBaruIds;
+  });
+
+  const fileBaruIds = proses();
+  if (fileBaruIds === null) return null;
+  ubahEntri(id, { judul, ringkasan, data }); // sekaligus memperbarui updated_at
+  db.prepare('UPDATE entri SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
+  return { entri: getEntri(id), fileBaruIds };
 }
 
 // ========== BACA ==========
@@ -221,8 +282,12 @@ function formatNilai(v, kedalaman = 0) {
   return String(v);
 }
 
+const SINGKATAN = { po: 'PO', so: 'SO', do: 'DO', pic: 'PIC', wa: 'WA', hp: 'HP', ppn: 'PPN', npwp: 'NPWP', id: 'ID', pt: 'PT', cv: 'CV', ud: 'UD', no: 'No.', qty: 'Qty', uom: 'UOM' };
+
+/** "no_po" -> "No. PO", "nama_outlet" -> "Nama outlet" */
 function labelKunci(k) {
-  const s = String(k).replace(/[_-]+/g, ' ').trim();
+  const kata = String(k).split(/[_\-\s]+/).filter(Boolean).map((w) => SINGKATAN[w.toLowerCase()] || w.toLowerCase());
+  const s = kata.join(' ');
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
@@ -265,6 +330,47 @@ function captionUntukOwner(entri, file) {
 function barisRingkas(r) {
   const asal = r.is_grup ? r.grup_nama || 'grup' : 'pribadi';
   return `${formatId(r.id)} · ${r.jenis} · ${r.judul || '(tanpa judul)'} · ${r.pengirim_nama || '?'} @ ${asal} · ${formatWaktuDb(r.created_at)}`;
+}
+
+// ========== TAMPILAN UNTUK SHEETS ==========
+
+function barisItemObjek(o) {
+  const isi = Object.entries(o).filter(([, v]) => v !== null && v !== undefined && v !== '');
+  const lead = isi.find(([k, v]) => typeof v === 'string' && /nama|item|barang|produk|deskripsi/i.test(k)) || isi.find(([, v]) => typeof v === 'string');
+  const sisa = isi.filter((e) => e !== lead).map(([k, v]) => `${String(k).replace(/[_-]+/g, ' ')} ${formatNilai(v)}`);
+  return [lead ? formatNilai(lead[1]) : null, ...sisa].filter(Boolean).join(' · ');
+}
+
+/** Isi data_json sebagai teks berbaris yang enak dibaca di satu sel (Label: nilai, item pakai butir). */
+function detailSheet(data) {
+  if (!data || typeof data !== 'object') return '';
+  const baris = [];
+  for (const [k, v] of Object.entries(data)) {
+    if (v === null || v === undefined || v === '') continue;
+    if (Array.isArray(v) && v.length && typeof v[0] === 'object' && v[0] !== null) {
+      baris.push(`${labelKunci(k)}:`);
+      for (const x of v) baris.push(`  • ${barisItemObjek(x)}`);
+    } else if (typeof v === 'object' && !Array.isArray(v)) {
+      baris.push(`${labelKunci(k)}:`);
+      for (const [sk, sv] of Object.entries(v)) if (sv !== null && sv !== '') baris.push(`  ${labelKunci(sk)}: ${formatNilai(sv)}`);
+    } else {
+      baris.push(`${labelKunci(k)}: ${formatNilai(v)}`);
+    }
+  }
+  return baris.join('\n');
+}
+
+const KUNCI_NOMINAL = ['total', 'grand_total', 'total_harga', 'total_tagihan', 'nominal', 'jumlah_bayar', 'total_bayar', 'jumlah'];
+
+/** Angka nominal utama (rupiah) kalau ada di data, untuk kolom yang bisa diurutkan/dijumlah di Sheets. */
+function nominalDari(data) {
+  if (!data || typeof data !== 'object') return '';
+  for (const k of KUNCI_NOMINAL) {
+    const v = data[k];
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && /^\d+([.,]\d+)*$/.test(v.trim())) return Number(v.replace(/[.,]/g, ''));
+  }
+  return '';
 }
 
 // ========== EKSPOR ==========
@@ -338,6 +444,12 @@ module.exports = {
   ubahEntri,
   hapusEntri,
   setSheetRow,
+  catatPesan,
+  pesanDiEntri,
+  cariEntriByPesan,
+  tambahKeEntri,
+  detailSheet,
+  nominalDari,
   formatKartu,
   captionUntukOwner,
   barisRingkas,

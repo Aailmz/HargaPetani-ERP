@@ -23,7 +23,10 @@ const { nomorDariJid, potong } = require('./utils');
 const MAX_DUMP_PER_JAM = parseInt(process.env.MAX_DUMP_PER_JAM, 10) || 30;
 const BUFFER_MENIT = 5; // pesan sebelum tag yang masih ikut disimpan
 const BUFFER_MAX = 8; // maksimal pesan dari buffer yang ikut per tag
-const BUFFER_SIMPAN_MAX = 40; // maksimal pesan yang diingat per grup
+const BUFFER_SIMPAN_MAX = 300; // maksimal pesan yang diingat per grup (buat thread reply)
+const BUFFER_JAM = 6; // thread reply diingat selama ini (di memori, hilang kalau bot restart)
+const MAX_PESAN_THREAD = 15; // maksimal pesan thread yang ikut dicatat sekali tag
+const PERINTAH_SINGKAT = 25; // teks tag sependek ini dianggap perintah ("simpan"), bukan isi
 const TEKS_PENDEK = 60; // tag dengan teks sependek ini dianggap "simpan yang tadi"
 const MAX_LAMPIRAN_PER_DUMP = 8;
 const CACHE_GRUP_MENIT = 30;
@@ -100,9 +103,39 @@ const buffers = new Map();
 function simpanKeBuffer(chatJid, item) {
   const arr = buffers.get(chatJid) || [];
   arr.push(item);
-  const batas = Date.now() - 15 * 60000;
+  const batas = Date.now() - BUFFER_JAM * 3600000;
   const segar = arr.filter((x) => x.ts >= batas).slice(-BUFFER_SIMPAN_MAX);
   buffers.set(chatJid, segar);
+}
+
+/**
+ * Kumpulkan seluruh thread reply (di buffer) yang memuat pesan `targetId`: naik ke pesan paling atas
+ * yang diketahui, lalu turun ke semua balasan (teks maupun voice note) dari pesan-pesan itu.
+ * Pesan yang men-tag bot (perintah) tidak ikut karena tidak punya isi.
+ */
+function kumpulkanThread(chatJid, targetId) {
+  const arr = buffers.get(chatJid) || [];
+  const byId = new Map(arr.map((x) => [x.id, x]));
+
+  let akar = targetId;
+  const dilewati = new Set();
+  while (byId.get(akar)?.replyToId && !dilewati.has(akar) && dilewati.size < 20) {
+    dilewati.add(akar);
+    akar = byId.get(akar).replyToId;
+  }
+
+  const anggota = new Set([akar]);
+  let bertambah = true;
+  while (bertambah && anggota.size < 80) {
+    bertambah = false;
+    for (const x of arr) {
+      if (!anggota.has(x.id) && x.replyToId && anggota.has(x.replyToId)) {
+        anggota.add(x.id);
+        bertambah = true;
+      }
+    }
+  }
+  return arr.filter((x) => anggota.has(x.id) && (x.teks || x.info)).sort((a, b) => a.ts - b.ts);
 }
 
 function ambilDariBuffer(chatJid, senderJid, kecualiId) {
@@ -151,56 +184,116 @@ function enqueue(kunci, fn) {
 // ========== KUMPULKAN KONTEN ==========
 
 async function unduhLampiran(daftar) {
-  // daftar: [{ waMsg, info }]; dibatasi 3 sekaligus supaya API baca gambar tidak kebanjiran
+  // daftar: [{ waMsg, info, id }]; dibatasi 3 sekaligus supaya API baca gambar tidak kebanjiran
   const hasil = [];
   for (let i = 0; i < daftar.length; i += 3) {
     const kelompok = daftar.slice(i, i + 3);
     const diproses = await Promise.all(kelompok.map(({ waMsg, info }) => media.ambilLampiran(waMsg, info, sock)));
-    hasil.push(...diproses.map((lp) => ({ ...lp, caption: '' })));
+    hasil.push(...diproses.map((lp, j) => ({ ...lp, caption: '', pesanId: kelompok[j].id })));
   }
   return hasil;
 }
 
-async function kumpulkanKonten({ m, content, chatJid, isGrup, senderJid, ci, balasBot }) {
-  const bagianTeks = [];
-  const antreanLampiran = [];
+function jamWib(ts) {
+  return new Date(ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' }).replace('.', ':');
+}
+
+/** Pesan yang di-reply, dibentuk dari isi kutipan WhatsApp (dipakai kalau pesan itu tidak ada di buffer). */
+function itemDariKutipan(ci, chatJid) {
+  const qContent = normalizeMessageContent(ci.quotedMessage);
+  return {
+    id: ci.stanzaId,
+    ts: 0,
+    nama: nomorDariJid(ci.participant) || 'seseorang',
+    replyKe: null,
+    teks: ambilTeks(qContent),
+    info: media.infoLampiran(qContent),
+    waMsg: { key: { remoteJid: chatJid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: ci.quotedMessage },
+  };
+}
+
+/**
+ * Susun konten satu dump dari: pesan yang men-tag bot, pesan yang di-reply beserta seluruh thread-nya
+ * (balasan teks/voice dari siapa pun), atau pesan-pesan terbaru pengirim yang sama ("simpan yang tadi").
+ */
+async function kumpulkanKonten({ m, content, chatJid, isGrup, senderJid, pengirimNama, ci, balasBot }) {
+  const teksSendiri = hapusMentionBot(ambilTeks(content));
+  const infoSendiri = media.infoLampiran(content);
+  const adaTargetReply = !!ci?.quotedMessage && !balasBot; // reply ke bot = jawaban, bukan target
+  const namaBuffer = new Map((buffers.get(chatJid) || []).map((x) => [x.id, x.nama]));
+  const namaDari = (id, nomor) => namaBuffer.get(id) || nomor || 'seseorang';
+
+  let items = [];
   let kuat = false;
 
-  const teksSendiri = hapusMentionBot(ambilTeks(content));
-  if (teksSendiri) bagianTeks.push(teksSendiri);
-
-  const infoSendiri = media.infoLampiran(content);
-  if (infoSendiri) antreanLampiran.push({ waMsg: m, info: infoSendiri });
-
-  // Reply ke pesan orang lain = target dump yang eksplisit (reply ke bot sendiri itu jawaban, bukan target)
-  const quoted = ci?.quotedMessage;
-  const adaTargetReply = !!quoted && !balasBot;
   if (adaTargetReply) {
-    const qContent = normalizeMessageContent(quoted);
-    const qTeks = ambilTeks(qContent);
-    const dari = nomorDariJid(ci.participant) || 'seseorang';
-    if (qTeks) bagianTeks.push(`Pesan yang di-reply (dari ${dari}):\n${qTeks}`);
-    const qInfo = media.infoLampiran(qContent);
-    if (qInfo) {
-      const waQuoted = { key: { remoteJid: chatJid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: quoted };
-      antreanLampiran.push({ waMsg: waQuoted, info: qInfo });
+    if (isGrup) {
+      const thread = kumpulkanThread(chatJid, ci.stanzaId);
+      if (!thread.some((x) => x.id === ci.stanzaId)) items.push(itemDariKutipan(ci, chatJid));
+      for (const x of thread) {
+        x.dipakai = true;
+        items.push({ id: x.id, ts: x.ts, nama: x.nama, replyKe: x.replyToId ? namaDari(x.replyToId, x.replyKeNomor) : null, teks: x.teks, info: x.info, waMsg: x.waMsg });
+      }
+    } else {
+      items.push(itemDariKutipan(ci, chatJid));
     }
     kuat = true;
-  }
-
-  // "Simpan yang tadi": gabungkan pesan terbaru pengirim yang sama kalau tag-nya pendek dan bukan reply
-  if (isGrup && !adaTargetReply && teksSendiri.length < TEKS_PENDEK) {
-    const lama = ambilDariBuffer(chatJid, senderJid, m.key.id);
-    for (const x of lama) {
-      if (x.teks) bagianTeks.unshift(`Pesan sebelumnya dari ${x.nama || 'pengirim yang sama'}:\n${x.teks}`);
-      if (x.info) antreanLampiran.unshift({ waMsg: x.waMsg, info: x.info });
+  } else if (isGrup && teksSendiri.length < TEKS_PENDEK) {
+    // "Simpan yang tadi": gabungkan pesan terbaru pengirim yang sama
+    for (const x of ambilDariBuffer(chatJid, senderJid, m.key.id)) {
+      items.push({ id: x.id, ts: x.ts, nama: x.nama, replyKe: null, teks: x.teks, info: x.info, waMsg: x.waMsg });
+      kuat = true;
     }
-    if (lama.length) kuat = true;
   }
 
-  const dipakai = antreanLampiran.slice(-MAX_LAMPIRAN_PER_DUMP);
-  const lampiran = await unduhLampiran(dipakai);
-  return { teks: bagianTeks.join('\n\n'), lampiran, kuat };
+  items.sort((a, b) => a.ts - b.ts);
+  if (items.length > MAX_PESAN_THREAD) {
+    const target = items.find((x) => x.id === ci?.stanzaId);
+    items = items.slice(-MAX_PESAN_THREAD);
+    if (target && !items.includes(target)) items[0] = target;
+  }
+
+  // Teks pendek tanpa lampiran, di samping pesan lain, dianggap perintah ("simpan") dan bukan isi dump
+  const perintahSingkat = items.length > 0 && !infoSendiri && teksSendiri.length <= PERINTAH_SINGKAT;
+  if (!perintahSingkat && (teksSendiri || infoSendiri)) {
+    items.push({
+      id: m.key.id,
+      ts: Date.now(),
+      nama: pengirimNama,
+      replyKe: adaTargetReply ? namaDari(ci.stanzaId, nomorDariJid(ci.participant)) : null,
+      teks: teksSendiri,
+      info: infoSendiri,
+      waMsg: m,
+    });
+  }
+
+  const dipakai = items.filter((x) => x.info).slice(-MAX_LAMPIRAN_PER_DUMP);
+  dipakai.forEach((x, i) => {
+    x.lampiranIdx = i + 1;
+  });
+  const lampiran = await unduhLampiran(dipakai.map((x) => ({ waMsg: x.waMsg, info: x.info, id: x.id })));
+
+  // Satu pesan saja (kasus biasa) tampil apa adanya; lebih dari satu tampil sebagai percakapan berurutan
+  const tunggal = items.length === 1 && !adaTargetReply;
+  const bagian = items.map((x) => {
+    const penanda = x.lampiranIdx ? ` [lampiran ${x.lampiranIdx}: ${x.info.tipe}]` : x.info ? ' [lampiran tidak diikutkan, terlalu banyak]' : '';
+    if (tunggal) return { id: x.id, teks: x.teks };
+    const label = `[${[x.ts ? jamWib(x.ts) : null, x.nama].filter(Boolean).join(' ')}${x.replyKe ? ` ↪ ${x.replyKe}` : ''}]`;
+    return { id: x.id, teks: `${label}${x.teks ? `: ${x.teks}` : ''}${penanda}`.trim() };
+  });
+
+  const catatan = [];
+  if (perintahSingkat && teksSendiri) catatan.push(`Pesan tag: "${teksSendiri}"`);
+  if (!teksSendiri && !infoSendiri && items.length > 0) catatan.push('(Pesan yang men-tag hanya berisi tag, artinya minta dicatat.)');
+
+  return {
+    teks: [...bagian.map((b) => b.teks), ...catatan].filter(Boolean).join('\n'),
+    bagian: bagian.filter((b) => b.teks),
+    lampiran,
+    pesanIds: items.map((x) => x.id).filter(Boolean),
+    kuat,
+    hanyaVoice: lampiran.length > 0 && items.every((x) => !x.teks && x.info?.tipe === 'voice') && !teksSendiri,
+  };
 }
 
 // ========== KIRIM ==========
@@ -232,6 +325,7 @@ function simpanVoiceLangsung({ konten, chat, pengirim }) {
       pengirim,
       lampiran: [{ path: lp.path, namaAsli: lp.namaAsli, mimetype: lp.mimetype, tipe: lp.tipe, ukuran: lp.ukuran }],
     });
+    dump.catatPesan(entri.id, chat.jid, [lp.pesanId]);
     ids.push(entri.id);
     kartu.push(dump.formatKartu(entri));
   }
@@ -257,21 +351,20 @@ async function prosesPesan({ m, content, chatJid, isGrup, senderJid, pengirimNam
 
   const chat = { jid: isGrup ? chatJid : senderJid || chatJid, isGrup, grupNama: isGrup ? await namaGrup(chatJid) : null };
   const pengirim = { jid: senderJid, nama: pengirimNama };
-  const konten = await kumpulkanKonten({ m, content, chatJid, isGrup, senderJid, ci, balasBot });
+  const konten = await kumpulkanKonten({ m, content, chatJid, isGrup, senderJid, pengirimNama, ci, balasBot });
 
   const lampiranBermasalah = konten.lampiran.filter((l) => l.gagal && /terlalu besar/.test(l.gagal));
   if (lampiranBermasalah.length) {
     await kirimTeks(replyJid, `Ada file yang terlalu besar (batas ${media.MAX_BYTES / 1048576} MB), jadi tidak ikut disimpan.`, quotedMsg);
   }
-  const lampiranOk = konten.lampiran.filter((l) => !(l.gagal && /terlalu besar/.test(l.gagal)));
-  konten.lampiran = lampiranOk;
 
   console.log(`📩 [${isGrup ? chat.grupNama || chatJid : 'pribadi'}] ${pengirimNama || senderJid}: "${potong(konten.teks, 80)}" + ${konten.lampiran.length} lampiran`);
 
   // Voice note murni: simpan langsung, tidak perlu LLM
-  const cumaVoice = !konten.teks && konten.lampiran.length > 0 && konten.lampiran.every((l) => l.tipe === 'voice');
+  const cumaVoice = konten.hanyaVoice;
   let entriBaru = [];
   let entriDiubah = [];
+  let entriLanjut = [];
   let files = [];
   let balasan;
 
@@ -297,6 +390,7 @@ async function prosesPesan({ m, content, chatJid, isGrup, senderJid, pengirimNam
     }
     entriBaru = hasil.entriBaru;
     entriDiubah = hasil.entriDiubah;
+    entriLanjut = hasil.entriLanjut;
     files = hasil.files;
     balasan = hasil.balasan;
     if (!balasan) balasan = 'Maaf, aku belum nangkep maksudnya. Boleh diulang?';
@@ -316,20 +410,31 @@ async function prosesPesan({ m, content, chatJid, isGrup, senderJid, pengirimNam
   }
 
   // Pekerjaan susulan (salinan ke owner + Sheets) tidak menahan balasan ke pengirim
-  pascaSimpan(entriBaru, entriDiubah).catch((err) => console.error('❌ Pasca-simpan gagal:', err.message));
+  pascaSimpan(entriBaru, entriDiubah, entriLanjut).catch((err) => console.error('❌ Pasca-simpan gagal:', err.message));
 }
 
-async function pascaSimpan(entriBaru, entriDiubah) {
+async function pascaSimpan(entriBaru, entriDiubah, entriLanjut = []) {
   for (const id of entriBaru) {
     const entri = dump.getEntri(id);
     if (!entri) continue;
     await sync.teruskanKeOwner(sock, entri);
     await sync.sinkronSheets(id);
   }
+  // Entri yang dilanjutkan: cuma file barunya yang diteruskan ke owner
+  for (const { id, fileBaruIds } of entriLanjut) {
+    const entri = dump.getEntri(id);
+    if (entri && fileBaruIds.length) await sync.teruskanKeOwner(sock, entri, fileBaruIds);
+  }
   for (const id of entriDiubah) await sync.sinkronSheets(id);
 }
 
 // ========== TERIMA PESAN ==========
+
+/** Tautan reply sebuah pesan (membalas pesan mana), dipakai untuk merangkai thread. */
+function infoReply(ci) {
+  if (!ci?.quotedMessage || !ci.stanzaId) return { replyToId: null, replyKeNomor: null };
+  return { replyToId: ci.stanzaId, replyKeNomor: nomorDariJid(ci.participant) };
+}
 
 function tanganiPesan(m) {
   const chatJid = m.key.remoteJid;
@@ -355,13 +460,13 @@ function tanganiPesan(m) {
 
   // Grup: hanya merespons kalau di-tag atau membalas pesan bot. Selain itu cuma diingat sebentar di memori.
   if (isGrup && !ditag && !balasBot) {
-    simpanKeBuffer(chatJid, { id: m.key.id, ts: Date.now(), senderJid, nama: pengirimNama, waMsg: m, teks, info, dipakai: false });
+    simpanKeBuffer(chatJid, { id: m.key.id, ts: Date.now(), senderJid, nama: pengirimNama, waMsg: m, teks, info, dipakai: false, ...infoReply(ci) });
     return;
   }
 
   if (isGrup) {
     // pesan yang men-tag bot tidak boleh ikut dipakai ulang sebagai buffer
-    simpanKeBuffer(chatJid, { id: m.key.id, ts: Date.now(), senderJid, nama: pengirimNama, waMsg: m, teks: '', info: null, dipakai: true });
+    simpanKeBuffer(chatJid, { id: m.key.id, ts: Date.now(), senderJid, nama: pengirimNama, waMsg: m, teks: '', info: null, dipakai: true, ...infoReply(ci) });
   }
 
   const kunciAntrian = isGrup ? chatJid : senderJid || chatJid;
@@ -407,7 +512,10 @@ async function startBot() {
       perbaruiIdentitasBot();
       console.log('\n✅ Bot dump data terkoneksi!');
       console.log(`Identitas bot: ${[...botNomor].join(', ')}`);
-      console.log(`Salinan file dikirim ke owner: ${sync.ownerJid() || '(OWNER_JID belum diisi)'}\n`);
+      console.log(`Salinan file dikirim ke owner: ${sync.ownerJid() || '(OWNER_JID belum diisi)'}`);
+      console.log(`Google Sheets: ${sync.statusSheets()}\n`);
+      // siapkan tab Sheets sekarang (buat/rapikan/isi ulang bila perlu), tanpa menunggu dump pertama
+      Promise.resolve(sync.siapkanSheetsAwal()).catch((err) => console.error('❌ Persiapan Sheets gagal:', err.message));
     }
   });
 

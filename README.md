@@ -9,7 +9,9 @@ Versi ERP sebelumnya (SO, DO, invoice, PO) ada di git history, commit `a56cf4f`.
 - **Grup**: tag bot, atau balas pesan bot. Selain itu bot diam.
   - `@bot` + teks/foto/file: langsung disimpan.
   - Kirim beberapa foto/pesan, lalu `@bot simpan`: pesan terbaru dari pengirim yang sama (maksimal 5 menit, 8 pesan) ikut disimpan sebagai satu dump.
-  - Reply ke pesan orang lain sambil tag bot: pesan yang di-reply yang disimpan.
+  - Reply ke pesan orang lain sambil tag bot: pesan itu yang disimpan, **beserta seluruh thread-nya**. Balasan teks maupun voice note dari siapa pun (tanpa tag) ikut jadi konteks, diurutkan sesuai waktu dengan penanda siapa membalas siapa. Kalau reply-nya hanya berisi tag, artinya "catat ini".
+  - Thread yang sama dicatat lagi setelah ada balasan baru: bot melanjutkan dump yang lama (hanya pesan baru yang ditambahkan, ringkasan dan data diperbarui) dan tidak membuat dump ganda.
+  - Thread diingat bot di memori selama 6 jam dan hilang kalau bot restart. Pesan di luar thread atau yang sudah lewat dari itu tidak ikut.
 - **Chat pribadi**: siapa saja boleh. Setiap pesan dianggap dump.
 - Bot langsung menyimpan dan membalas kartu ringkas (`DUMP-0042`, jenis, judul, field). Bot bertanya hanya kalau benar-benar ambigu, lalu simpan setelah dijawab.
 - Koreksi: "bukan, ini tagihan supplier", "hapus DUMP-0042", "ubah total jadi 500rb".
@@ -38,7 +40,9 @@ File yang mengandung gambar/dokumen/voice diteruskan ke WhatsApp owner (`OWNER_J
 
 ## Google Sheets (opsional)
 
-Kalau `GOOGLE_SERVICE_ACCOUNT_PATH` dan `GOOGLE_SPREADSHEET_ID` terisi, tiap dump ditulis juga ke tab `Dump` (dibuat otomatis): ID, waktu, grup, pengirim, jenis, judul, ringkasan, data JSON, nama file, status. Gambarnya tidak masuk Sheets, hanya nama file (`DUMP-0042.jpg`). Edit/hapus lewat chat ikut memperbarui barisnya. Matikan dengan `DUMP_SHEETS=off`.
+Kalau `GOOGLE_SERVICE_ACCOUNT_PATH` dan `GOOGLE_SPREADSHEET_ID` terisi, tiap dump ditulis juga ke tab `Dump` (dibuat otomatis). Kolomnya: ID, Waktu, Grup / Chat, Pengirim, Jenis, Judul, Ringkasan, Nominal (Rp), Detail, File, Status, Data mentah (JSON). Kolom *Detail* berisi isi data dalam bentuk `Label: nilai` dan daftar item berbutir, supaya terbaca tanpa membuka JSON. Header diwarnai dan dibekukan, kolom diberi lebar yang pas, teks panjang membungkus, ada filter, dan nominal berformat ribuan.
+
+Tampilan ini diterapkan otomatis tiap bot start. Kalau susunan kolom di tab berbeda dari yang diharapkan bot (misalnya tab lama), isi tab dari baris 2 ke bawah **ditulis ulang seluruhnya dari database**. Jangan menaruh catatan manual di tab `Dump`. Untuk memaksa tulis ulang: `node sync-sheets.js`. Gambarnya tidak masuk Sheets, hanya nama file (`DUMP-0042.jpg`). Edit/hapus lewat chat ikut memperbarui barisnya. Matikan dengan `DUMP_SHEETS=off`.
 
 ## Konfigurasi `.env`
 

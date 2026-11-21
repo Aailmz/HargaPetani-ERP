@@ -56,6 +56,25 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'lanjutkan_data',
+      description:
+        'Tambahkan pesan baru ke dump yang SUDAH ada (misal ada balasan baru di thread yang sudah tercatat). Hanya pesan yang belum tercatat di dump itu yang ditambahkan ke teks asli, file barunya ikut disimpan. Field judul/ringkasan/data bisa diperbarui sekaligus (data digabung dengan yang lama).',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'ID dump yang dilanjutkan, cth "DUMP-0007".' },
+          judul: { type: 'string' },
+          ringkasan: { type: 'string', description: 'Ringkasan baru yang mencakup perkembangan terbaru.' },
+          data: { type: 'object', additionalProperties: true, description: 'Field baru atau yang berubah (null untuk menghapus field).' },
+          sumber: { type: 'string', enum: ['pesan_ini', 'tertunda'] },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'ubah_data',
       description: 'Ubah entri yang sudah tersimpan (misal user koreksi jenisnya, judulnya, atau ada field yang salah). Field di "data" digabung ke data lama; isi null untuk menghapus satu field.',
       parameters: {
@@ -163,6 +182,12 @@ ATURAN SIMPAN:
 - Pesan yang jelas bukan dump (sapaan, pertanyaan ke kamu, minta cari/ubah/hapus/rekap) ditangani dengan tool lain atau jawaban singkat. Jangan menyimpan basa-basi.
 - Kalau user koreksi data yang baru kamu simpan ("bukan, ini tagihan supplier"), pakai ubah_data dengan ID dari riwayat chat. Kalau minta batal/hapus, pakai hapus_data.
 
+THREAD DAN REPLY DI GRUP:
+- Konten bisa berupa potongan percakapan grup: baris seperti "[08:40 Budi]: ..." dan "[08:45 Sari ↪ Budi]: ..." (tanda ↪ artinya membalas). Itu satu kesatuan konteks, simpan SEMUANYA sebagai SATU dump dengan jenis sesuai topik utamanya (misal "purchase order"), bukan jenis "percakapan" atau "chat". Isi ringkasan dengan inti diskusi, dan masukkan hal penting dari balasan (status, keputusan, perubahan jumlah atau jadwal, siapa yang mengurus) ke data, misal field "tindak_lanjut" atau "catatan".
+- Baris "(Pesan yang men-tag hanya berisi tag, artinya minta dicatat.)" berarti user minta thread itu dicatat. Jangan bertanya apa pun, langsung simpan_data.
+- Voice note di thread tidak bisa dibaca isinya. Sebut di ringkasan bahwa ada voice note dari siapa, dan file-nya ikut tersimpan sebagai lampiran.
+- Kalau ada blok "SUDAH TERSIMPAN", sebagian pesan di thread ini sudah tercatat. Kalau pesan baru itu lanjutan atau kabar terbaru dari hal yang sama, panggil lanjutkan_data dengan ID itu (perbarui ringkasan dan data supaya mencerminkan keadaan terbaru) dan JANGAN membuat dump baru. Kalau topiknya benar-benar berbeda, pakai simpan_data.
+
 CARA MENGISI:
 - jenis: singkat, huruf kecil. Pakai jenis yang sudah ada kalau cocok, buat baru hanya kalau memang berbeda.
 - judul: spesifik, maksimal 80 karakter.
@@ -201,8 +226,11 @@ function buatPesanUser(ctx) {
   const header = `[Dari: ${ctx.pengirim.nama || 'tanpa nama'}${ctx.chat.isGrup ? ` · grup: ${ctx.chat.grupNama || '?'}` : ''}]`;
   const utama = renderKonten(ctx.konten, 'Pesan ini:') || 'Pesan ini: (kosong)';
   const tertunda = ctx.pending ? '\n\n' + renderKonten(ctx.pending, 'KONTEN TERTUNDA dari pesan sebelumnya (belum disimpan, kamu tadi bertanya soal ini; kalau pesan ini jawabannya, simpan dengan sumber="tertunda"):') : '';
+  const sudah = ctx.sudahAda.length
+    ? `\n\nSUDAH TERSIMPAN: sebagian pesan di atas sudah tercatat sebagai ${ctx.sudahAda.map((e) => `${dump.formatId(e.id)} (${e.jenis}: ${e.judul || 'tanpa judul'})`).join('; ')}.`
+    : '';
   // "ringkas" masuk riwayat chat (tanpa blok tertunda supaya riwayat tidak berisi duplikat)
-  return { lengkap: `${header}\n${utama}${tertunda}`, ringkas: `${header}\n${utama}` };
+  return { lengkap: `${header}\n${utama}${sudah}${tertunda}`, ringkas: `${header}\n${utama}` };
 }
 
 // ========== EKSEKUTOR TOOL ==========
@@ -242,7 +270,61 @@ async function eksekusiSimpanData({ jenis, judul, ringkasan, data, sumber, lampi
   if (pakaiTertunda) ctx.pakaiTertunda = true;
   ctx.entriBaru.push(entri.id);
 
+  // Catat pesan WhatsApp mana yang masuk ke dump ini (teks hanya ke dump pertama giliran ini,
+  // lampiran ke dump pemiliknya) supaya balasan berikutnya di thread bisa dilanjutkan ke dump yang sama.
+  const idTeks = ctx.teksSudahDicatat ? [] : (sumberKonten.bagian || []).map((b) => b.id);
+  ctx.teksSudahDicatat = true;
+  dump.catatPesan(entri.id, ctx.chat.jid, [...idTeks, ...dipilih.map((l) => l.pesanId)]);
+
   return { sukses: true, id: dump.formatId(entri.id), kartu: dump.formatKartu(entri) };
+}
+
+function blokLampiran(l) {
+  return `[Lampiran ${l.idx}: ${l.tipe}${l.namaAsli ? ` ${l.namaAsli}` : ''}]\n${l.teksHasil || ''}`;
+}
+
+async function eksekusiLanjutkanData({ id, judul, ringkasan, data, sumber }, ctx) {
+  const cek = cekAkses(id, ctx);
+  if (cek.error) return cek;
+  const sumberKonten = sumber === 'tertunda' ? ctx.pending : ctx.konten;
+  if (!sumberKonten) return { error: 'Tidak ada konten tertunda.' };
+
+  const sudah = dump.pesanDiEntri(cek.entri.id);
+  const bagianBaru = (sumberKonten.bagian || []).filter((b) => !sudah.has(b.id));
+  const kandidat = pilihLampiran(sumberKonten);
+  const lampiranBaru = kandidat.filter((l) => !(l.pesanId && sudah.has(l.pesanId)));
+
+  // lampiran yang ternyata sudah tersimpan di dump itu tidak perlu disimpan dua kali
+  for (const l of kandidat) {
+    l.dipakai = true;
+    if (!lampiranBaru.includes(l) && l.path) {
+      try {
+        fs.unlinkSync(l.path);
+      } catch {
+        /* abaikan */
+      }
+    }
+  }
+  if (sumber === 'tertunda') ctx.pakaiTertunda = true;
+
+  if (!bagianBaru.length && !lampiranBaru.length) {
+    return { sukses: false, pesan: `Tidak ada pesan baru: seluruh isi thread ini sudah ada di ${dump.formatId(cek.entri.id)}.` };
+  }
+
+  const teksTambahan = [...bagianBaru.map((b) => b.teks), ...lampiranBaru.map(blokLampiran)].filter(Boolean).join('\n\n');
+  const hasil = dump.tambahKeEntri(cek.entri.id, {
+    teksTambahan,
+    judul,
+    ringkasan,
+    data,
+    lampiran: lampiranBaru.filter((l) => l.path && fs.existsSync(l.path)).map((l) => ({ path: l.path, namaAsli: l.namaAsli, mimetype: l.mimetype, tipe: l.tipe, ukuran: l.ukuran })),
+  });
+  dump.catatPesan(cek.entri.id, ctx.chat.jid, [...bagianBaru.map((b) => b.id), ...lampiranBaru.map((l) => l.pesanId)]);
+
+  ctx.teksSudahDicatat = true;
+  ctx.entriDiubah.push(cek.entri.id);
+  ctx.entriLanjut.push({ id: cek.entri.id, fileBaruIds: hasil.fileBaruIds });
+  return { sukses: true, kartu: dump.formatKartu(hasil.entri, { judulKartu: 'Dilanjutkan' }) };
 }
 
 function cekAkses(idInput, ctx) {
@@ -299,6 +381,7 @@ async function eksekusiEksporData({ jenis, format }, ctx) {
 
 const EKSEKUTOR = {
   simpan_data: eksekusiSimpanData,
+  lanjutkan_data: eksekusiLanjutkanData,
   ubah_data: eksekusiUbahData,
   hapus_data: eksekusiHapusData,
   batalkan_tertunda: eksekusiBatalkanTertunda,
@@ -346,7 +429,13 @@ function selesaikanKonten(ctx) {
   if (jadiTertunda) {
     // konten tertunda lama (kalau masih ada) tergantikan, file-nya dibuang
     for (const l of ctx.pending?.lampiran || []) if (!l.dipakai) hapusFile(l.path);
-    simpanPending(ctx.chatKey, { teks: ctx.entriBaru.length ? '' : ctx.konten.teks, lampiran: sisaLampiran });
+    const sudahTersimpan = ctx.entriBaru.length > 0;
+    simpanPending(ctx.chatKey, {
+      teks: sudahTersimpan ? '' : ctx.konten.teks,
+      bagian: sudahTersimpan ? [] : ctx.konten.bagian || [],
+      pesanIds: ctx.konten.pesanIds || [],
+      lampiran: sisaLampiran,
+    });
     return;
   }
 
@@ -372,11 +461,14 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
     isOwner,
     konten: { ...konten, lampiran: konten.lampiran.map((l, i) => ({ ...l, idx: i + 1 })) },
     pending: getPending(chatKey),
+    sudahAda: dump.cariEntriByPesan(chat.jid, konten.pesanIds),
     adaTool: false,
     pakaiTertunda: false,
     batalTertunda: false,
     entriBaru: [],
     entriDiubah: [],
+    entriLanjut: [],
+    teksSudahDicatat: false,
     filesUntukDikirim: [],
   };
   if (ctx.pending) ctx.pending.lampiran = (ctx.pending.lampiran || []).map((l, i) => ({ ...l, idx: i + 1 }));
@@ -435,7 +527,7 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
         console.error(`❌ Error tool ${nama}:`, err.message);
         hasil = { error: `Gagal eksekusi: ${err.message}` };
       }
-      if (hasil?.kartu && (nama === 'simpan_data' || nama === 'ubah_data')) kartu.push(hasil);
+      if (hasil?.kartu && ['simpan_data', 'ubah_data', 'lanjutkan_data'].includes(nama)) kartu.push(hasil);
 
       messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(hasil) });
     }
@@ -458,6 +550,7 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
     error,
     entriBaru: ctx.entriBaru,
     entriDiubah: ctx.entriDiubah,
+    entriLanjut: ctx.entriLanjut,
     files: ctx.filesUntukDikirim,
     // teks yang disimpan ke riwayat chat supaya percakapan lanjutan punya konteks
     teksUser: pesanUser.ringkas,

@@ -56,6 +56,17 @@ db.exec(`
     FOREIGN KEY (entri_id) REFERENCES entri(id)
   );
 
+  -- Pesan WhatsApp mana saja yang sudah masuk ke entri mana. Dipakai supaya thread grup
+  -- yang dicatat dua kali (mis. ada balasan baru) bisa dilanjutkan ke entri yang sama.
+  CREATE TABLE IF NOT EXISTS entri_pesan (
+    entri_id INTEGER NOT NULL,
+    chat_jid TEXT NOT NULL,
+    pesan_id TEXT NOT NULL,
+    PRIMARY KEY (entri_id, pesan_id),
+    FOREIGN KEY (entri_id) REFERENCES entri(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_entri_pesan ON entri_pesan(chat_jid, pesan_id);
+
   CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_key TEXT NOT NULL,

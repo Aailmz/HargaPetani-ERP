@@ -2,6 +2,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const OpenAI = require('openai');
 const ExcelJS = require('exceljs');
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 const { DIR_TMP } = require('./db');
@@ -13,9 +14,13 @@ const MAX_TEKS_HASIL = 30000;
 // bisa diganti di test supaya tidak perlu koneksi WhatsApp
 let downloader = downloadMediaMessage;
 
-const { client, MODEL } = require('./ai');
-
-const FORMAT_GAMBAR_CLAUDE = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const client = new OpenAI({
+  apiKey: process.env.AI_API_KEY,
+  baseURL: process.env.AI_BASE_URL,
+  timeout: 60 * 1000,
+  maxRetries: 1,
+});
+const MODEL_VISION = process.env.AI_VISION_MODEL || process.env.AI_MODEL;
 
 // sharp cuma dipakai buat mengecilkan gambar sebelum dikirim ke model (file asli tetap utuh)
 let sharp = null;
@@ -89,17 +94,14 @@ async function bacaGambar(buffer, mimetype) {
     }
   }
 
-  if (!FORMAT_GAMBAR_CLAUDE.has(mime)) throw new Error(`format gambar ${mime} tidak didukung`);
-
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 3000,
-    output_config: { effort: 'low' }, // transkripsi tidak butuh penalaran panjang
+  const completion = await client.chat.completions.create({
+    model: MODEL_VISION,
+    temperature: 0.1,
+    max_tokens: 1800,
     messages: [
       {
         role: 'user',
         content: [
-          { type: 'image', source: { type: 'base64', media_type: mime, data: data.toString('base64') } },
           {
             type: 'text',
             text:
@@ -110,12 +112,12 @@ async function bacaGambar(buffer, mimetype) {
               'Bagian yang tidak terbaca atau meragukan tulis [tidak jelas], jangan diisi tebakan. Kalau tidak ada teks, tulis "(tidak ada teks)".\n' +
               'KEJELASAN: satu dari "jelas", "sebagian tidak jelas", atau "buram/tidak terbaca", disusul daftar bagian penting yang meragukan (mis. total, tanggal, nama, angka tertentu).',
           },
+          { type: 'image_url', image_url: { url: `data:${mime};base64,${data.toString('base64')}` } },
         ],
       },
     ],
   });
-  if (response.stop_reason === 'refusal') throw new Error('Claude menolak membaca gambar ini');
-  return response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+  return (completion.choices[0]?.message?.content || '').trim();
 }
 
 async function bacaPdf(buffer) {

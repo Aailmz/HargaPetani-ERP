@@ -1,18 +1,25 @@
 require('dotenv').config();
 const fs = require('fs');
+const OpenAI = require('openai');
 const { simpanPending, hapusPending, getPending } = require('./db');
 const dump = require('./dump');
 const { formatWaktu, potong } = require('./utils');
 
-const { client, MODEL, EFFORT } = require('./ai');
+const client = new OpenAI({
+  apiKey: process.env.AI_API_KEY,
+  baseURL: process.env.AI_BASE_URL,
+  timeout: 60 * 1000,
+  maxRetries: 1,
+});
+
+const MODEL = process.env.AI_MODEL;
 const MAX_TOOL_ITERATIONS = 8;
-const MAX_TOKENS_JAWABAN = 8000;
 const MAX_TEKS_LAMPIRAN_DI_PROMPT = 4000;
 const TEKS_KUAT_MIN = 200; // teks sepanjang ini dianggap konten sungguhan, bukan sekadar jawaban singkat
 
 // ========== TOOLS ==========
 
-const DEFINISI_TOOL = [
+const TOOLS = [
   {
     type: 'function',
     function: {
@@ -153,13 +160,6 @@ const DEFINISI_TOOL = [
     },
   },
 ];
-
-// Format tool Claude: { name, description, input_schema }
-const TOOLS = DEFINISI_TOOL.map((t) => ({
-  name: t.function.name,
-  description: t.function.description,
-  input_schema: t.function.parameters,
-}));
 
 // ========== SYSTEM PROMPT ==========
 
@@ -480,27 +480,25 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
   if (ctx.pending) ctx.pending.lampiran = (ctx.pending.lampiran || []).map((l, i) => ({ ...l, idx: i + 1 }));
 
   const pesanUser = buatPesanUser(ctx);
-  const system = buatSystemPrompt(ctx);
-
-  // Pesan pertama harus dari user: riwayat dipotong per jumlah, jadi bisa saja dimulai dari balasan bot
-  const riwayatRapi = [...riwayat];
-  while (riwayatRapi.length && riwayatRapi[0].role !== 'user') riwayatRapi.shift();
-  const messages = [...riwayatRapi, { role: 'user', content: pesanUser.lengkap }];
+  const messages = [
+    { role: 'system', content: buatSystemPrompt(ctx) },
+    ...riwayat,
+    { role: 'user', content: pesanUser.lengkap },
+  ];
 
   const kartu = [];
   let jawabanFinal = null;
   let error = null;
 
   for (let iterasi = 0; iterasi < MAX_TOOL_ITERATIONS; iterasi++) {
-    let response;
+    let completion;
     try {
-      response = await client.messages.create({
+      completion = await client.chat.completions.create({
         model: MODEL,
-        max_tokens: MAX_TOKENS_JAWABAN,
-        system,
-        tools: TOOLS,
         messages,
-        ...(EFFORT ? { output_config: { effort: EFFORT } } : {}),
+        tools: TOOLS,
+        tool_choice: 'auto',
+        temperature: 0.2,
       });
     } catch (err) {
       console.error('❌ Agent API error:', err.message);
@@ -508,30 +506,22 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
       break;
     }
 
-    // Isi balasan (termasuk blok thinking) harus dikembalikan utuh di giliran berikutnya
-    messages.push({ role: 'assistant', content: response.content });
+    const pesanAi = completion.choices[0].message;
+    messages.push(pesanAi);
 
-    if (response.stop_reason === 'refusal') {
-      error = 'Claude menolak memproses isi ini.';
-      jawabanFinal = 'Maaf, isi ini tidak bisa saya proses.';
-      break;
-    }
-    if (response.stop_reason === 'max_tokens') {
-      error = 'Jawaban model terpotong (max_tokens).';
+    if (!pesanAi.tool_calls?.length) {
+      jawabanFinal = pesanAi.content;
       break;
     }
 
-    const toolUses = response.content.filter((b) => b.type === 'tool_use');
-    if (!toolUses.length) {
-      jawabanFinal = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-      break;
-    }
-
-    // Semua hasil tool dikirim balik dalam satu pesan user
-    const hasilSemua = [];
-    for (const tu of toolUses) {
-      const nama = tu.name;
-      const argumen = tu.input && typeof tu.input === 'object' ? tu.input : {};
+    for (const toolCall of pesanAi.tool_calls) {
+      const nama = toolCall.function.name;
+      let argumen;
+      try {
+        argumen = JSON.parse(toolCall.function.arguments || '{}');
+      } catch {
+        argumen = {};
+      }
       ctx.adaTool = true;
       console.log(`🔧 Tool: ${nama}(${potong(JSON.stringify(argumen), 300)})`);
 
@@ -545,14 +535,8 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
       }
       if (hasil?.kartu && ['simpan_data', 'ubah_data', 'lanjutkan_data'].includes(nama)) kartu.push(hasil);
 
-      hasilSemua.push({
-        type: 'tool_result',
-        tool_use_id: tu.id,
-        content: JSON.stringify(hasil),
-        ...(hasil?.error ? { is_error: true } : {}),
-      });
+      messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(hasil) });
     }
-    messages.push({ role: 'user', content: hasilSemua });
   }
 
   if (!error && jawabanFinal === null) error = 'Agent melewati batas iterasi tool.';

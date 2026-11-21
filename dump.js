@@ -253,10 +253,15 @@ function dumpTerbuka(chatJid, menit = DISKUSI_MENIT) {
   return baris.map((r) => getEntri(r.id)).filter((e) => e && daftarKonfirmasi(e.data).length);
 }
 
-/** Kapan jendela diskusi sebuah dump dimulai (ms epoch), dari pembuatan/pembaruan terakhir. */
+/** Kapan dump dibuat (ms epoch). Obrolan sejak saat itu dipakai sebagai konteks diskusi. */
 function awalDiskusiMs(e) {
-  const t = Date.parse(`${String(e.updated_at || e.created_at).replace(' ', 'T')}Z`);
+  const t = Date.parse(`${String(e.created_at).replace(' ', 'T')}Z`);
   return Number.isNaN(t) ? Date.now() : t;
+}
+
+/** Perpanjang jendela diskusi (mis. setelah bot mengajukan pertanyaan lanjutan) tanpa mengubah isi data. */
+function sentuhEntri(id) {
+  db.prepare('UPDATE entri SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
 }
 
 /** Status yang ditampilkan di Sheets. */
@@ -524,6 +529,7 @@ module.exports = {
   daftarKonfirmasi,
   dumpTerbuka,
   awalDiskusiMs,
+  sentuhEntri,
   DISKUSI_MENIT,
   catatPesan,
   pesanDiEntri,

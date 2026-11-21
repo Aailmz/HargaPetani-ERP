@@ -623,7 +623,8 @@ Tugasmu: tentukan apakah pesan-pesan terbaru di grup menjawab atau mengoreksi pe
 
 ATURAN:
 - Sebagian besar obrolan TIDAK berkaitan. Kalau pesan tidak jelas berkaitan dengan data dan pertanyaan terbuka itu (barang, angka, satuan, atau pihak yang sama), jawab persis [DIAM] tanpa memanggil tool. Jangan membalas basa-basi, jangan berkomentar, jangan bertanya.
-- Terapkan perubahan HANYA kalau pesan-pesan itu jelas dan cukup menjawab satu atau lebih pertanyaan. Kalau jawabannya bertentangan antar orang, setengah-setengah, atau masih bisa dibaca dua cara, jawab [DIAM] dan biarkan pertanyaan tetap terbuka.
+- Terapkan perubahan HANYA kalau pesan-pesan itu jelas dan cukup menjawab satu atau lebih pertanyaan. Kalau belum jelas tetapi orang-orangnya MASIH SEDANG berdiskusi (saling bertanya, "sebentar saya cek", belum ada kesimpulan), jawab [DIAM] dan tunggu.
+- BERTANYA kalau obrolan tampak menuju kesimpulan atau sudah ditutup (ada yang menyimpulkan, sepakat, "oke fix", "ya sudah segitu", "jadi begitu ya") TETAPI hasilnya masih ambigu, bertentangan antar orang, atau belum menjawab semua pertanyaan, sehingga kamu tidak bisa memperbarui tanpa menebak. Jangan memanggil tool; jawab satu baris yang diawali persis "TANYA: " lalu satu pertanyaan singkat dan spesifik yang menyebut ID data dan apa yang bertentangan atau belum jelas, contoh: "TANYA: DUMP-0007: Harga 8.000 itu per pack atau per pcs?". Jangan bertanya kalau obrolan belum mengarah ke kesimpulan, dan jangan menanyakan hal yang jawabannya sudah ada di obrolan.
 - Untuk menerapkan, panggil ubah_data untuk data itu: ubah field sesuai yang dikatakan (jangan menambah asumsi di luar pesan), isi catatan_koreksi dengan kutipan pesan yang relevan lengkap dengan nama pengirim dan jam, dan isi perlu_konfirmasi hanya dengan pertanyaan yang MASIH belum terjawab ([] kalau semuanya terjawab). Pesan yang tidak relevan jangan dikutip.
 - Pesan boleh berasal dari beberapa orang. Gabungkan kalau saling melengkapi (misal satu menyebut isi per pack, yang lain menjelaskan harga per pcs).
 - Setelah ubah_data, balas SATU kalimat pendek bahasa Indonesia yang menyebut apa yang kamu perbarui dari obrolan tadi. Kartu data ditambahkan otomatis. Kapitalisasi normal, tanpa tanda strip panjang (—) atau double dash (--).`;
@@ -668,8 +669,16 @@ async function jalankanDiskusi({ chat, dumps, pesan }) {
   const toolsDiskusi = TOOLS.filter((t) => t.function.name === 'ubah_data');
   const { jawabanFinal, error, kartu } = await loopTool(messages, ctx, toolsDiskusi, 4);
 
-  // Tanpa perubahan data, bot tetap diam, apa pun yang dikatakan model
-  if (!ctx.entriDiubah.length) return { balasan: null, error, entriDiubah: [], teksUser: null };
+  const ringkasPesanBaru = `[Obrolan grup]\n${barisPesan.filter((x) => x.includes('(baru)')).join('\n')}`;
+
+  // Tanpa perubahan data bot diam, kecuali model menilai obrolan sudah menuju kesimpulan tapi masih ambigu: bertanya
+  if (!ctx.entriDiubah.length) {
+    const tanya = /^\s*TANYA:\s*([\s\S]+)/i.exec((jawabanFinal || '').trim());
+    if (tanya?.[1].trim()) {
+      return { balasan: tanya[1].trim(), tanya: true, error, entriDiubah: [], teksUser: ringkasPesanBaru };
+    }
+    return { balasan: null, tanya: false, error, entriDiubah: [], teksUser: null };
+  }
 
   const semuaKartu = kartu.map((k) => k.kartu);
   let balasan = (jawabanFinal || '').replace(/\[DIAM\]/gi, '').trim();
@@ -678,12 +687,7 @@ async function jalankanDiskusi({ chat, dumps, pesan }) {
     balasan = semuaKartu.join('\n\n') + (balasan ? `\n\n${balasan}` : '');
   }
 
-  return {
-    balasan: balasan || null,
-    error,
-    entriDiubah: ctx.entriDiubah,
-    teksUser: `[Obrolan grup]\n${barisPesan.filter((x) => x.includes('(baru)')).join('\n')}`,
-  };
+  return { balasan: balasan || null, tanya: false, error, entriDiubah: ctx.entriDiubah, teksUser: ringkasPesanBaru };
 }
 
 module.exports = { jalankanAgent, jalankanDiskusi };

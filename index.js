@@ -28,6 +28,7 @@ const BUFFER_JAM = 6; // thread reply diingat selama ini (di memori, hilang kala
 const MAX_PESAN_THREAD = 15; // maksimal pesan thread yang ikut dicatat sekali tag
 const DISKUSI_JEDA_DETIK = Number(process.env.DISKUSI_JEDA_DETIK ?? 20); // tunggu obrolan reda sebelum bot memeriksanya
 const DISKUSI_MAKS_PER_JAM = 20; // batas pemeriksaan obrolan per grup, menjaga biaya
+const DISKUSI_TANYA_JEDA_MENIT = Number(process.env.DISKUSI_TANYA_JEDA_MENIT ?? 10); // jarak minimal antar pertanyaan bot di satu grup
 const DISKUSI_TEKS_MIN = 3; // pesan lebih pendek dari ini (mis. "ok") tidak memicu pemeriksaan
 const PERINTAH_SINGKAT = 25; // teks tag sependek ini dianggap perintah ("simpan"), bukan isi
 const TEKS_PENDEK = 60; // tag dengan teks sependek ini dianggap "simpan yang tadi"
@@ -448,6 +449,7 @@ async function pascaSimpan(entriBaru, entriDiubah, entriLanjut = []) {
 const timerDiskusi = new Map();
 const diskusiTerakhir = new Map(); // chatJid -> ts pesan terakhir yang sudah diperiksa
 const diskusiRiwayat = new Map(); // chatJid -> daftar waktu pemeriksaan
+const diskusiTanyaTerakhir = new Map(); // chatJid -> ts pertanyaan terakhir bot
 
 function jadwalkanDiskusi(chatJid) {
   if (!(DISKUSI_JEDA_DETIK >= 0) || dump.dumpTerbuka(chatJid).length === 0) return;
@@ -502,14 +504,34 @@ async function prosesDiskusi(chatJid) {
     })),
   });
 
-  if (!hasil.balasan || !hasil.entriDiubah.length) return;
+  if (!hasil.balasan) return;
+
+  // Pertanyaan saat obrolan menuju kesimpulan tapi masih ambigu: dibatasi jaraknya supaya bot tidak cerewet
+  if (hasil.tanya) {
+    const sejak = Date.now() - (diskusiTanyaTerakhir.get(chatJid) || 0);
+    if (sejak < DISKUSI_TANYA_JEDA_MENIT * 60000) {
+      console.log('(Pertanyaan diskusi ditahan: baru saja bertanya di grup ini)');
+      return;
+    }
+    diskusiTanyaTerakhir.set(chatJid, Date.now());
+  } else if (!hasil.entriDiubah.length) {
+    return;
+  }
 
   const terkirim = await kirimTeks(chatJid, hasil.balasan, null);
+
+  // Pesan bot ini dikaitkan ke dump yang dibahas, jadi membalasnya langsung tepat sasaran
+  const disebut = [...hasil.balasan.matchAll(/DUMP-(\d+)/g)].map((x) => Number(x[1]));
+  const idDibahas = hasil.tanya ? (disebut.length ? disebut : terbuka.map((e) => e.id)) : hasil.entriDiubah;
   const idPesanBot = terkirim?.key?.id;
-  if (idPesanBot) for (const id of new Set(hasil.entriDiubah)) dump.catatPesan(id, chatJid, [idPesanBot]);
+  for (const id of new Set(idDibahas)) {
+    if (idPesanBot) dump.catatPesan(id, chatJid, [idPesanBot]);
+    if (hasil.tanya) dump.sentuhEntri(id); // pertanyaan baru memperpanjang jendela diskusi
+  }
+
   simpanChatHistory(chatJid, 'user', hasil.teksUser);
   simpanChatHistory(chatJid, 'assistant', hasil.balasan);
-  pascaSimpan([], hasil.entriDiubah, []).catch((err) => console.error('❌ Pasca-simpan gagal:', err.message));
+  if (hasil.entriDiubah.length) pascaSimpan([], hasil.entriDiubah, []).catch((err) => console.error('❌ Pasca-simpan gagal:', err.message));
 }
 
 // ========== TERIMA PESAN ==========

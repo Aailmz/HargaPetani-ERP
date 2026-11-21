@@ -19,7 +19,7 @@ const KOLOM = [
   { judul: 'Nominal (Rp)', lebar: 105, angka: true },
   { judul: 'Detail', lebar: 430, wrap: true },
   { judul: 'File', lebar: 150, wrap: true },
-  { judul: 'Status', lebar: 75 },
+  { judul: 'Status', lebar: 115 },
   { judul: 'Data mentah (JSON)', lebar: 200 },
 ];
 const HEADER = KOLOM.map((k) => k.judul);
@@ -93,7 +93,7 @@ function barisSheet(e) {
     dump.nominalDari(e.data),
     potong(dump.detailSheet(e.data), MAX_SEL),
     e.files.map((f) => f.nama).join('\n'),
-    e.status === 'AKTIF' ? 'Aktif' : 'Dihapus',
+    dump.statusEntri(e),
     potong(e.data_json || '', MAX_SEL),
   ];
 }

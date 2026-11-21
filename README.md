@@ -16,7 +16,8 @@ Versi ERP sebelumnya (SO, DO, invoice, PO) ada di git history, commit `a56cf4f`.
 - Bot langsung menyimpan dan membalas kartu ringkas (`DUMP-0042`, jenis, judul, field). Bot bertanya hanya kalau benar-benar ambigu, lalu simpan setelah dijawab.
 - Koreksi: "bukan, ini tagihan supplier", "hapus DUMP-0042", "ubah total jadi 500rb".
 - **Hal yang meragukan** (misal total tidak sama dengan qty x harga, satuan harga tidak jelas): bot tetap menyimpan datanya apa adanya, tapi menaruh pertanyaannya di daftar *Perlu dikonfirmasi*. Kartu menampilkannya dengan ajakan "Balas pesan ini", dan di Sheets statusnya jadi `Perlu konfirmasi` (bisa difilter).
-- **Menjawab/mengoreksi:** *balas (reply) kartu bot itu*, siapa pun orangnya, tanpa perlu tag. Bot tahu kartu itu milik dump yang mana, menerapkan koreksinya, dan menghapus poin yang sudah terjawab. Teks asli tidak pernah ditimpa: koreksi dicatat terpisah di teks asli (`--- Koreksi <waktu> oleh <nama> ---`). Alternatif: tag bot dan sebut ID-nya, misal `@bot DUMP-0007: 10 pack = 50 pcs, 1 pcs 8000`. Pesan biasa tanpa reply dan tanpa tag tidak dibaca bot.
+- **Menjawab/mengoreksi:** *balas (reply) kartu bot itu*, siapa pun orangnya, tanpa perlu tag. Bot tahu kartu itu milik dump yang mana, menerapkan koreksinya, dan menghapus poin yang sudah terjawab. Teks asli tidak pernah ditimpa: koreksi dicatat terpisah di teks asli (`--- Koreksi <waktu> oleh <nama> ---`). Alternatif: tag bot dan sebut ID-nya, misal `@bot DUMP-0007: 10 pack = 50 pcs, 1 pcs 8000`.
+- **Menyimak diskusi (otomatis, tanpa tag):** setelah bot mengajukan pertanyaan konfirmasi di grup, bot ikut menyimak obrolan grup selama `DISKUSI_MENIT` menit (bawaan 60). Obrolan dikumpulkan sampai reda ~20 detik, lalu model menilai apakah itu menjawab pertanyaan terbuka. Hanya kalau jelas dan cukup, data diperbarui dan bot melapor sekali dengan kartu. Obrolan yang tidak nyambung, bertentangan, atau setengah-setengah dibiarkan dan bot diam. Jawaban dari beberapa orang digabung. Kutipan obrolan yang dipakai dicatat di log koreksi; obrolan lain tidak disimpan. Begitu semua pertanyaan terjawab, bot berhenti menyimak. **Di luar jendela itu, atau di grup yang tidak punya pertanyaan terbuka, bot tidak membaca obrolan sama sekali.** Batas 20 pemeriksaan per grup per jam menjaga biaya. Matikan dengan `DISKUSI_MENIT=0`.
 - `@bot rekap` / `@bot rekap nota belanja json`: kirim file CSV/JSON. `@bot ada jenis apa aja`, `@bot cari cabe`.
 
 ## Penyimpanan
@@ -60,6 +61,8 @@ DUMP_SHEET_TAB=Dump                                # opsional
 DUMP_SHEETS=off                                    # opsional, matikan sync Sheets
 MAX_DUMP_PER_JAM=30                                # opsional
 MAX_FILE_MB=10                                     # opsional
+DISKUSI_MENIT=60                                   # opsional, lama bot menyimak obrolan setelah bertanya (0 = mati)
+DISKUSI_JEDA_DETIK=20                              # opsional, tunggu obrolan reda sebelum diperiksa
 ```
 
 ## Menjalankan

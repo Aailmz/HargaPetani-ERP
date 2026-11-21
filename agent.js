@@ -490,56 +490,20 @@ function selesaikanKonten(ctx) {
   for (const l of sisaLampiran) hapusFile(l.path);
 }
 
-// ========== LOOP AGENT ==========
+// ========== LOOP TOOL (dipakai percakapan biasa dan mode diskusi) ==========
 
-/**
- * @param {object} p
- * @param {string} p.chatKey
- * @param {{jid:string,isGrup:boolean,grupNama?:string}} p.chat
- * @param {{jid:string,nama?:string}} p.pengirim
- * @param {boolean} p.isOwner
- * @param {{teks:string, lampiran:object[], kuat?:boolean}} p.konten
- * @param {{role:string,content:string}[]} p.riwayat
- */
-async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat }) {
-  const ctx = {
-    chatKey,
-    chat,
-    pengirim,
-    isOwner,
-    konten: { ...konten, lampiran: konten.lampiran.map((l, i) => ({ ...l, idx: i + 1 })) },
-    pending: getPending(chatKey),
-    sudahAda: dump.cariEntriByPesan(chat.jid, konten.pesanIds),
-    rujukan: (konten.rujukanIds || []).map((rid) => dump.getEntri(rid)).filter((e) => e && e.status === 'AKTIF'),
-    adaTool: false,
-    pakaiTertunda: false,
-    batalTertunda: false,
-    entriBaru: [],
-    entriDiubah: [],
-    entriLanjut: [],
-    teksSudahDicatat: false,
-    filesUntukDikirim: [],
-  };
-  if (ctx.pending) ctx.pending.lampiran = (ctx.pending.lampiran || []).map((l, i) => ({ ...l, idx: i + 1 }));
-
-  const pesanUser = buatPesanUser(ctx);
-  const messages = [
-    { role: 'system', content: buatSystemPrompt(ctx) },
-    ...riwayat,
-    { role: 'user', content: pesanUser.lengkap },
-  ];
-
+async function loopTool(messages, ctx, tools, maksIterasi) {
   const kartu = [];
   let jawabanFinal = null;
   let error = null;
 
-  for (let iterasi = 0; iterasi < MAX_TOOL_ITERATIONS; iterasi++) {
+  for (let iterasi = 0; iterasi < maksIterasi; iterasi++) {
     let completion;
     try {
       completion = await client.chat.completions.create({
         model: MODEL,
         messages,
-        tools: TOOLS,
+        tools,
         tool_choice: 'auto',
         temperature: 0.2,
       });
@@ -583,6 +547,51 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
   }
 
   if (!error && jawabanFinal === null) error = 'Agent melewati batas iterasi tool.';
+  return { jawabanFinal, error, kartu };
+}
+
+// ========== LOOP AGENT ==========
+
+/**
+ * @param {object} p
+ * @param {string} p.chatKey
+ * @param {{jid:string,isGrup:boolean,grupNama?:string}} p.chat
+ * @param {{jid:string,nama?:string}} p.pengirim
+ * @param {boolean} p.isOwner
+ * @param {{teks:string, lampiran:object[], kuat?:boolean}} p.konten
+ * @param {{role:string,content:string}[]} p.riwayat
+ */
+async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat }) {
+  const ctx = {
+    chatKey,
+    chat,
+    pengirim,
+    isOwner,
+    konten: { ...konten, lampiran: konten.lampiran.map((l, i) => ({ ...l, idx: i + 1 })) },
+    pending: getPending(chatKey),
+    sudahAda: dump.cariEntriByPesan(chat.jid, konten.pesanIds),
+    rujukan: (konten.rujukanIds || []).map((rid) => dump.getEntri(rid)).filter((e) => e && e.status === 'AKTIF'),
+    adaTool: false,
+    pakaiTertunda: false,
+    batalTertunda: false,
+    entriBaru: [],
+    entriDiubah: [],
+    entriLanjut: [],
+    teksSudahDicatat: false,
+    filesUntukDikirim: [],
+  };
+  if (ctx.pending) ctx.pending.lampiran = (ctx.pending.lampiran || []).map((l, i) => ({ ...l, idx: i + 1 }));
+
+  const pesanUser = buatPesanUser(ctx);
+  const messages = [
+    { role: 'system', content: buatSystemPrompt(ctx) },
+    ...riwayat,
+    { role: 'user', content: pesanUser.lengkap },
+  ];
+
+  const hasilLoop = await loopTool(messages, ctx, TOOLS, MAX_TOOL_ITERATIONS);
+  const { jawabanFinal, kartu } = hasilLoop;
+  const error = hasilLoop.error;
 
   // Model kadang lupa menyertakan kartu: pastikan pengirim selalu melihat ID yang tersimpan.
   const semuaKartu = kartu.map((k) => k.kartu);
@@ -606,4 +615,75 @@ async function jalankanAgent({ chatKey, chat, pengirim, isOwner, konten, riwayat
   };
 }
 
-module.exports = { jalankanAgent };
+// ========== MODE DISKUSI (menyimak obrolan grup setelah bot bertanya) ==========
+
+const PROMPT_DISKUSI = `Kamu pencatat data tim "Harga Petani" dan sedang menyimak obrolan grup setelah kamu mengajukan pertanyaan konfirmasi tentang data yang tersimpan. Tidak ada yang men-tag kamu, kamu hanya ikut menyimak.
+
+Tugasmu: tentukan apakah pesan-pesan terbaru di grup menjawab atau mengoreksi pertanyaan terbuka pada salah satu data di bawah.
+
+ATURAN:
+- Sebagian besar obrolan TIDAK berkaitan. Kalau pesan tidak jelas berkaitan dengan data dan pertanyaan terbuka itu (barang, angka, satuan, atau pihak yang sama), jawab persis [DIAM] tanpa memanggil tool. Jangan membalas basa-basi, jangan berkomentar, jangan bertanya.
+- Terapkan perubahan HANYA kalau pesan-pesan itu jelas dan cukup menjawab satu atau lebih pertanyaan. Kalau jawabannya bertentangan antar orang, setengah-setengah, atau masih bisa dibaca dua cara, jawab [DIAM] dan biarkan pertanyaan tetap terbuka.
+- Untuk menerapkan, panggil ubah_data untuk data itu: ubah field sesuai yang dikatakan (jangan menambah asumsi di luar pesan), isi catatan_koreksi dengan kutipan pesan yang relevan lengkap dengan nama pengirim dan jam, dan isi perlu_konfirmasi hanya dengan pertanyaan yang MASIH belum terjawab ([] kalau semuanya terjawab). Pesan yang tidak relevan jangan dikutip.
+- Pesan boleh berasal dari beberapa orang. Gabungkan kalau saling melengkapi (misal satu menyebut isi per pack, yang lain menjelaskan harga per pcs).
+- Setelah ubah_data, balas SATU kalimat pendek bahasa Indonesia yang menyebut apa yang kamu perbarui dari obrolan tadi. Kartu data ditambahkan otomatis. Kapitalisasi normal, tanpa tanda strip panjang (—) atau double dash (--).`;
+
+/**
+ * @param {{chat:{jid:string,isGrup:boolean,grupNama?:string}, dumps:object[], pesan:{id:string,nama:string,jam:string,teks:string,baru:boolean,replyKe?:string}[]}} p
+ * Mengembalikan balasan hanya kalau ada data yang benar-benar diperbarui; selain itu bot diam.
+ */
+async function jalankanDiskusi({ chat, dumps, pesan }) {
+  const ctx = {
+    chat,
+    pengirim: { jid: '', nama: null },
+    isOwner: false,
+    konten: { teks: '', lampiran: [], pesanIds: pesan.map((x) => x.id) },
+    adaTool: false,
+    entriBaru: [],
+    entriDiubah: [],
+    entriLanjut: [],
+    filesUntukDikirim: [],
+  };
+
+  const blokDump = dumps
+    .map((e) =>
+      [
+        `${dump.formatId(e.id)} (${e.jenis}: ${e.judul || 'tanpa judul'})`,
+        `Data saat ini: ${potong(JSON.stringify(e.data || {}), 3000)}`,
+        `Pertanyaan terbuka:\n${dump.daftarKonfirmasi(e.data).map((x, i) => `${i + 1}. ${x}`).join('\n')}`,
+        `Cuplikan teks asli: ${potong(e.teks_asli || '', 600)}`,
+      ].join('\n'),
+    )
+    .join('\n\n');
+
+  const barisPesan = pesan.map((x) => `[${x.jam} ${x.nama}${x.replyKe ? ` ↪ ${x.replyKe}` : ''}]${x.baru ? ' (baru)' : ''}: ${potong(x.teks, 500)}`);
+  const messages = [
+    { role: 'system', content: `${PROMPT_DISKUSI}\n\nSekarang: ${formatWaktu()} (WIB).` },
+    {
+      role: 'user',
+      content: `DATA DENGAN PERTANYAAN TERBUKA:\n${blokDump}\n\nOBROLAN GRUP TERBARU (urut waktu; yang bertanda "(baru)" belum pernah kamu periksa):\n${barisPesan.join('\n')}`,
+    },
+  ];
+
+  const toolsDiskusi = TOOLS.filter((t) => t.function.name === 'ubah_data');
+  const { jawabanFinal, error, kartu } = await loopTool(messages, ctx, toolsDiskusi, 4);
+
+  // Tanpa perubahan data, bot tetap diam, apa pun yang dikatakan model
+  if (!ctx.entriDiubah.length) return { balasan: null, error, entriDiubah: [], teksUser: null };
+
+  const semuaKartu = kartu.map((k) => k.kartu);
+  let balasan = (jawabanFinal || '').replace(/\[DIAM\]/gi, '').trim();
+  const idHilang = ctx.entriDiubah.some((id) => !balasan.includes(dump.formatId(id)));
+  if (semuaKartu.length && (idHilang || !balasan)) {
+    balasan = semuaKartu.join('\n\n') + (balasan ? `\n\n${balasan}` : '');
+  }
+
+  return {
+    balasan: balasan || null,
+    error,
+    entriDiubah: ctx.entriDiubah,
+    teksUser: `[Obrolan grup]\n${barisPesan.filter((x) => x.includes('(baru)')).join('\n')}`,
+  };
+}
+
+module.exports = { jalankanAgent, jalankanDiskusi };

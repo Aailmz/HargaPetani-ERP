@@ -26,6 +26,9 @@ const BUFFER_MAX = 8; // maksimal pesan dari buffer yang ikut per tag
 const BUFFER_SIMPAN_MAX = 300; // maksimal pesan yang diingat per grup (buat thread reply)
 const BUFFER_JAM = 6; // thread reply diingat selama ini (di memori, hilang kalau bot restart)
 const MAX_PESAN_THREAD = 15; // maksimal pesan thread yang ikut dicatat sekali tag
+const DISKUSI_JEDA_DETIK = Number(process.env.DISKUSI_JEDA_DETIK ?? 20); // tunggu obrolan reda sebelum bot memeriksanya
+const DISKUSI_MAKS_PER_JAM = 20; // batas pemeriksaan obrolan per grup, menjaga biaya
+const DISKUSI_TEKS_MIN = 3; // pesan lebih pendek dari ini (mis. "ok") tidak memicu pemeriksaan
 const PERINTAH_SINGKAT = 25; // teks tag sependek ini dianggap perintah ("simpan"), bukan isi
 const TEKS_PENDEK = 60; // tag dengan teks sependek ini dianggap "simpan yang tadi"
 const MAX_LAMPIRAN_PER_DUMP = 8;
@@ -437,6 +440,78 @@ async function pascaSimpan(entriBaru, entriDiubah, entriLanjut = []) {
   for (const id of entriDiubah) await sync.sinkronSheets(id);
 }
 
+// ========== MENYIMAK DISKUSI SETELAH BOT BERTANYA ==========
+// Berlaku hanya di grup yang punya dump dengan pertanyaan terbuka (perlu_konfirmasi) dan hanya selama
+// jendela diskusi (DISKUSI_MENIT). Di luar itu bot tidak membaca obrolan sama sekali. Obrolan dinilai
+// relevan atau tidak oleh model; tanpa perubahan data bot tetap diam.
+
+const timerDiskusi = new Map();
+const diskusiTerakhir = new Map(); // chatJid -> ts pesan terakhir yang sudah diperiksa
+const diskusiRiwayat = new Map(); // chatJid -> daftar waktu pemeriksaan
+
+function jadwalkanDiskusi(chatJid) {
+  if (!(DISKUSI_JEDA_DETIK >= 0) || dump.dumpTerbuka(chatJid).length === 0) return;
+  clearTimeout(timerDiskusi.get(chatJid));
+  const timer = setTimeout(() => {
+    timerDiskusi.delete(chatJid);
+    enqueue(chatJid, () => prosesDiskusi(chatJid)).catch((err) => console.error('❌ Diskusi gagal:', err.message));
+  }, DISKUSI_JEDA_DETIK * 1000);
+  timerDiskusi.set(chatJid, timer);
+}
+
+function bolehPeriksaDiskusi(chatJid) {
+  const sekarang = Date.now();
+  const arr = (diskusiRiwayat.get(chatJid) || []).filter((t) => sekarang - t < 3600000);
+  if (arr.length >= DISKUSI_MAKS_PER_JAM) {
+    diskusiRiwayat.set(chatJid, arr);
+    return false;
+  }
+  arr.push(sekarang);
+  diskusiRiwayat.set(chatJid, arr);
+  return true;
+}
+
+async function prosesDiskusi(chatJid) {
+  const terbuka = dump.dumpTerbuka(chatJid);
+  if (!terbuka.length) return;
+
+  const awal = Math.min(...terbuka.map((e) => dump.awalDiskusiMs(e)));
+  const terakhir = diskusiTerakhir.get(chatJid) || 0;
+  const arr = buffers.get(chatJid) || [];
+  const namaDi = new Map(arr.map((x) => [x.id, x.nama]));
+  const pesan = arr.filter((x) => x.teks && x.ts >= awal).slice(-25);
+  if (!pesan.some((x) => x.ts > terakhir)) return;
+  if (!bolehPeriksaDiskusi(chatJid)) {
+    console.log(`(Diskusi ${chatJid} dilewati: batas ${DISKUSI_MAKS_PER_JAM} pemeriksaan per jam)`);
+    return;
+  }
+  diskusiTerakhir.set(chatJid, Math.max(...pesan.map((x) => x.ts)));
+
+  console.log(`👂 Menyimak diskusi di grup (${pesan.filter((x) => x.ts > terakhir).length} pesan baru, ${terbuka.length} dump terbuka)`);
+  const chat = { jid: chatJid, isGrup: true, grupNama: await namaGrup(chatJid) };
+  const hasil = await agent.jalankanDiskusi({
+    chat,
+    dumps: terbuka,
+    pesan: pesan.map((x) => ({
+      id: x.id,
+      nama: x.nama,
+      jam: jamWib(x.ts),
+      teks: x.teks,
+      baru: x.ts > terakhir,
+      replyKe: x.replyToId ? namaDi.get(x.replyToId) || x.replyKeNomor : null,
+    })),
+  });
+
+  if (!hasil.balasan || !hasil.entriDiubah.length) return;
+
+  const terkirim = await kirimTeks(chatJid, hasil.balasan, null);
+  const idPesanBot = terkirim?.key?.id;
+  if (idPesanBot) for (const id of new Set(hasil.entriDiubah)) dump.catatPesan(id, chatJid, [idPesanBot]);
+  simpanChatHistory(chatJid, 'user', hasil.teksUser);
+  simpanChatHistory(chatJid, 'assistant', hasil.balasan);
+  pascaSimpan([], hasil.entriDiubah, []).catch((err) => console.error('❌ Pasca-simpan gagal:', err.message));
+}
+
 // ========== TERIMA PESAN ==========
 
 /** Tautan reply sebuah pesan (membalas pesan mana), dipakai untuk merangkai thread. */
@@ -470,6 +545,7 @@ function tanganiPesan(m) {
   // Grup: hanya merespons kalau di-tag atau membalas pesan bot. Selain itu cuma diingat sebentar di memori.
   if (isGrup && !ditag && !balasBot) {
     simpanKeBuffer(chatJid, { id: m.key.id, ts: Date.now(), senderJid, nama: pengirimNama, waMsg: m, teks, info, dipakai: false, ...infoReply(ci) });
+    if (teks.length >= DISKUSI_TEKS_MIN) jadwalkanDiskusi(chatJid);
     return;
   }
 

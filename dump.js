@@ -235,6 +235,30 @@ function daftarKonfirmasi(data) {
   return Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : [];
 }
 
+// Berapa lama (menit) bot ikut menyimak obrolan grup setelah mengajukan pertanyaan konfirmasi. 0 = mati.
+const DISKUSI_MENIT = Number.parseInt(process.env.DISKUSI_MENIT ?? '60', 10) || 0;
+
+/**
+ * Dump di chat ini yang masih punya pertanyaan terbuka dan pertanyaannya diajukan/diperbarui
+ * dalam jendela diskusi. Selama ada, bot menyimak obrolan grup (tanpa perlu di-tag).
+ */
+function dumpTerbuka(chatJid, menit = DISKUSI_MENIT) {
+  if (!(menit > 0)) return [];
+  const baris = db.prepare(`
+    SELECT id FROM entri
+    WHERE chat_jid = ? AND status = 'AKTIF' AND data_json LIKE '%"perlu_konfirmasi"%'
+      AND COALESCE(updated_at, created_at) >= datetime('now', ?)
+    ORDER BY id DESC LIMIT 3
+  `).all(chatJid, `-${menit} minutes`);
+  return baris.map((r) => getEntri(r.id)).filter((e) => e && daftarKonfirmasi(e.data).length);
+}
+
+/** Kapan jendela diskusi sebuah dump dimulai (ms epoch), dari pembuatan/pembaruan terakhir. */
+function awalDiskusiMs(e) {
+  const t = Date.parse(`${String(e.updated_at || e.created_at).replace(' ', 'T')}Z`);
+  return Number.isNaN(t) ? Date.now() : t;
+}
+
 /** Status yang ditampilkan di Sheets. */
 function statusEntri(e) {
   if (e.status !== 'AKTIF') return 'Dihapus';
@@ -351,7 +375,11 @@ function formatKartu(entri, { judulKartu = 'Tersimpan' } = {}) {
   if (konfirmasi.length) {
     baris.push('', '❓ *Perlu dikonfirmasi:*');
     konfirmasi.forEach((x, i) => baris.push(`${i + 1}. ${x}`));
-    baris.push('_Balas pesan ini untuk menjawab atau mengoreksi._');
+    baris.push(
+      DISKUSI_MENIT > 0
+        ? `_Jawab saja di grup, saya ikut menyimak ${DISKUSI_MENIT} menit ke depan. Atau balas pesan ini._`
+        : '_Balas pesan ini untuk menjawab atau mengoreksi._',
+    );
   }
 
   if (entri.files?.length) baris.push('', `📎 ${entri.files.map((f) => f.nama).join(', ')}`);
@@ -494,6 +522,9 @@ module.exports = {
   setSheetRow,
   statusEntri,
   daftarKonfirmasi,
+  dumpTerbuka,
+  awalDiskusiMs,
+  DISKUSI_MENIT,
   catatPesan,
   pesanDiEntri,
   cariEntriByPesan,
